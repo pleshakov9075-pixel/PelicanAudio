@@ -1,0 +1,54 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: music_bot
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  api:
+    build: .
+    command: ["bash", "-lc", "alembic upgrade head && uvicorn app.api.main:app --host 0.0.0.0 --port 8000"]
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - ./storage:/app/storage
+    ports:
+      - "8000:8000"
+
+  bot:
+    build: .
+    command: ["bash", "-lc", "alembic upgrade head && python -m app.bot.main"]
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+      - api
+    volumes:
+      - ./storage:/app/storage
+
+  worker:
+    build: .
+    command: ["bash", "-lc", "alembic upgrade head && python -m app.worker.main"]
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - ./storage:/app/storage
+
+volumes:
+  postgres_data:
