@@ -21,13 +21,16 @@ services:
     build: .
     command: ["bash", "-lc", "alembic upgrade head && uvicorn app.api.main:app --host 0.0.0.0 --port 8000"]
     env_file: .env
+    environment:
+      PYTHONPATH: /app
     depends_on:
       - postgres
       - redis
+    working_dir: /app
     volumes:
       - ./storage:/app/storage
     ports:
-      - "8000:8000"
+      - "8080:8000"
 
   bot:
     build: .
@@ -37,6 +40,7 @@ services:
       - postgres
       - redis
       - api
+    working_dir: /app
     volumes:
       - ./storage:/app/storage
 
@@ -44,9 +48,12 @@ services:
     build: .
     command: ["bash", "-lc", "alembic upgrade head && python -m app.worker.main"]
     env_file: .env
+    environment:
+      PYTHONPATH: /app
     depends_on:
       - postgres
       - redis
+    working_dir: /app
     volumes:
       - ./storage:/app/storage
 
