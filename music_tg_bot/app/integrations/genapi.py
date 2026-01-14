@@ -24,7 +24,7 @@ class GenApiResult:
 
 def _headers() -> dict[str, str]:
     if not settings.genapi_api_key:
-        raise GenApiError("Не задан ключ GENAPI_API_KEY")
+        raise GenApiError("Не задан ключ API сервиса генерации")
     return {"Authorization": f"Bearer {settings.genapi_api_key}"}
 
 
@@ -78,7 +78,7 @@ def _request_with_retries(
                     time.sleep(delay)
                 continue
             logger.exception("Сетевая ошибка GenAPI (%s) после ретраев", operation)
-            raise GenApiError("⚠️ Не удалось связаться с GenAPI, попробуйте ещё раз") from exc
+            raise GenApiError("⚠️ Проблема с сетью. Пробую ещё раз…") from exc
         except httpx.RequestError as exc:
             last_exc = exc
             if _is_ssl_handshake_timeout(exc) and ssl_attempts < len(ssl_delays):
@@ -105,32 +105,27 @@ def _request_with_retries(
                     time.sleep(delay)
                 continue
             logger.exception("Сетевая ошибка GenAPI (%s) без ретраев", operation)
-            raise GenApiError("⚠️ Не удалось связаться с GenAPI, попробуйте ещё раз") from exc
+            raise GenApiError("⚠️ Проблема с сетью. Пробую ещё раз…") from exc
         except httpx.HTTPStatusError as exc:
             logger.error("HTTP ошибка GenAPI (%s): %s", operation, exc)
-            raise GenApiError(f"Ошибка GenAPI: {exc}") from exc
-    raise GenApiError("⚠️ Не удалось связаться с GenAPI, попробуйте ещё раз") from last_exc
+            raise GenApiError("⚠️ Сервис временно недоступен. Попробуй позже.") from exc
+    raise GenApiError("⚠️ Проблема с сетью. Пробую ещё раз…") from last_exc
 
 
 def _parse_grok_response(data: Any) -> str:
     payload, branch = _unwrap_payload(data)
     if branch:
         logger.info("GenAPI grok: извлечён вложенный payload из '%s'", branch)
+    payload = unwrap_payload(payload)
     if isinstance(payload, str):
         logger.info("GenAPI grok: получен текст напрямую")
         return payload
-    if isinstance(payload, dict) and "choices" in payload:
-        try:
-            logger.info("GenAPI grok: парсинг через choices")
-            return payload["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
-            logger.error("Неожиданный ответ GenAPI (choices): %s", list(payload.keys()))
-            raise GenApiError("Неожиданный ответ GenAPI") from exc
-    if isinstance(payload, dict) and "text" in payload:
-        logger.info("GenAPI grok: парсинг через text")
-        return str(payload["text"])
-    logger.error("Неожиданный ответ GenAPI (grok): %s", _payload_brief(payload))
-    raise GenApiError("Неожиданный ответ GenAPI")
+    try:
+        logger.info("GenAPI grok: парсинг текста")
+        return extract_llm_text(payload)
+    except ValueError as exc:
+        logger.error("Неожиданный ответ GenAPI (grok): %s", _payload_brief(payload))
+        raise GenApiError("❌ Не удалось получить ответ от сервиса генерации. Попробуй ещё раз.") from exc
 
 
 def _parse_suno_response(data: Any) -> list[str]:
@@ -159,8 +154,10 @@ def _maybe_processing(data: Any) -> tuple[bool, int | None]:
 
 def _raise_if_failed(data: Any) -> None:
     if isinstance(data, dict) and data.get("status") in {"failed", "error"}:
-        message = data.get("error") or data.get("message") or "Ошибка GenAPI"
-        raise GenApiError(message)
+        message = data.get("error") or data.get("message")
+        if isinstance(message, str) and "genapi" in message.lower():
+            message = None
+        raise GenApiError(message or "⚠️ Сервис временно недоступен. Попробуй позже.")
 
 
 def _payload_brief(data: Any) -> str:
@@ -173,10 +170,36 @@ def _payload_brief(data: Any) -> str:
 
 def _unwrap_payload(data: Any) -> tuple[Any, str | None]:
     if isinstance(data, dict):
-        for key in ("response", "result", "data", "payload"):
+        for key in ("response", "result", "full_response", "data", "payload"):
             if key in data:
                 return data[key], key
     return data, None
+
+
+def unwrap_payload(payload: Any) -> Any:
+    if isinstance(payload, list):
+        if len(payload) == 1:
+            return payload[0]
+        for item in payload:
+            if isinstance(item, dict) and ("choices" in item or "text" in item):
+                return item
+        return payload[0]
+    if isinstance(payload, dict):
+        return payload
+    return payload
+
+
+def extract_llm_text(payload: Any) -> str:
+    if isinstance(payload, dict) and "choices" in payload:
+        try:
+            return payload["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            keys = list(payload.keys())
+            raise ValueError(f"Unexpected choices payload keys={keys}") from exc
+    if isinstance(payload, dict) and "text" in payload:
+        return str(payload["text"])
+    keys = list(payload.keys()) if isinstance(payload, dict) else None
+    raise ValueError(f"Unexpected payload type={type(payload).__name__} keys={keys}")
 
 
 def _extract_urls_from_list(data: list[Any]) -> list[str]:
@@ -219,7 +242,7 @@ def _poll_request(
     attempt = 0
     while True:
         if time.monotonic() - start > timeout_seconds:
-            raise GenApiError("⏱️ Превышено время ожидания GenAPI")
+            raise GenApiError("⏱️ Превышено время ожидания сервиса генерации.")
         response = _request_with_retries("GET", url, None, timeout, operation)
         data = response.json()
         if isinstance(data, dict):
@@ -238,8 +261,10 @@ def _poll_request(
                 time.sleep(sleep_seconds)
                 continue
             if status in {"failed", "error"}:
-                message = data.get("error") or data.get("message") or "Ошибка GenAPI"
-                raise GenApiError(message)
+                message = data.get("error") or data.get("message")
+                if isinstance(message, str) and "genapi" in message.lower():
+                    message = None
+                raise GenApiError(message or "⚠️ Сервис временно недоступен. Попробуй позже.")
         return data
 
 
@@ -265,7 +290,7 @@ def call_grok(messages: list[dict[str, Any]]) -> GenApiResult:
     _raise_if_failed(data)
     is_processing, request_id = _maybe_processing(data)
     if is_processing and not request_id:
-        raise GenApiError("Неожиданный ответ GenAPI без request_id")
+        raise GenApiError("❌ Не удалось получить ответ от сервиса генерации. Попробуй ещё раз.")
     if is_processing and request_id:
         logger.info("GenAPI grok: request_id=%s status=processing", request_id)
         data = _poll_request(request_id, 90, timeout, "grok")
@@ -290,7 +315,7 @@ def call_suno(title: str, tags: str, prompt: str) -> GenApiResult:
     _raise_if_failed(data)
     is_processing, request_id = _maybe_processing(data)
     if is_processing and not request_id:
-        raise GenApiError("Неожиданный ответ GenAPI без request_id")
+        raise GenApiError("❌ Не удалось получить ответ от сервиса генерации. Попробуй ещё раз.")
     if is_processing and request_id:
         logger.info("GenAPI suno: request_id=%s status=processing", request_id)
         data = _poll_request(request_id, 180, timeout, "suno")

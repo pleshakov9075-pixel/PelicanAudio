@@ -7,6 +7,7 @@ from pathlib import Path
 import httpx
 from aiogram import Bot
 from aiogram.enums import ChatAction
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import FSInputFile
 from redis import Redis
 from rq import Queue
@@ -50,6 +51,17 @@ async def _send_or_edit_status(
                 extra={"chat_id": chat_id, "message_id": message_id},
             )
             return message_id
+        except TelegramBadRequest as exc:
+            if "message is not modified" in str(exc):
+                logger.debug(
+                    "Статусное сообщение без изменений",
+                    extra={"chat_id": chat_id, "message_id": message_id},
+                )
+                return message_id
+            logger.exception(
+                "Не удалось обновить статусное сообщение",
+                extra={"chat_id": chat_id, "message_id": message_id},
+            )
         except Exception as exc:
             logger.exception(
                 "Не удалось обновить статусное сообщение",
