@@ -1,19 +1,15 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
-from aiogram import Router, F
-from aiogram.enums import ChatAction
+from aiogram import Router
 from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 
 from app.bot.keyboards.inline import (
     presets_keyboard,
-    review_keyboard,
     text_payment_keyboard,
     title_keyboard,
-    second_variant_keyboard,
 )
 from app.bot.keyboards.reply import main_menu
 from app.bot.fsm.states import TrackStates
@@ -23,30 +19,24 @@ from app.core.repo import (
     consume_free_quota,
     charge_text,
     hold_audio,
+    create_task,
+    get_task,
+    update_task,
+)
+from app.core.task_status import (
+    AUDIO_QUEUED,
+    CANCELED,
+    EDIT_QUEUED,
+    PAYMENT_WAITING,
+    TEXT_QUEUED,
+    TITLE_WAITING,
+    WAITING_EDIT_REQUEST,
 )
 from app.core.utils import build_auto_title, is_valid_title, sanitize_title
-from app.integrations.genapi import call_grok, GenApiError
 from app.presets.loader import load_presets, get_preset
 
 router = Router()
 logger = logging.getLogger("bot.create_track")
-
-PROMPTS_DIR = Path(__file__).resolve().parents[2] / "presets" / "prompts"
-
-
-def _load_prompt(name: str) -> str:
-    return (PROMPTS_DIR / name).read_text(encoding="utf-8")
-
-
-def _build_grok_messages(system_text: str, user_text: str) -> list[dict]:
-    return [
-        {"role": "system", "content": [{"type": "text", "text": system_text}]},
-        {"role": "user", "content": [{"type": "text", "text": user_text}]},
-    ]
-
-
-def _render_template(template: str, **kwargs: str) -> str:
-    return template.format(**kwargs)
 
 
 def _preset_line(preset: dict) -> str:
@@ -57,9 +47,10 @@ def _with_preset(preset: dict, text: str) -> str:
     return f"{_preset_line(preset)}\n{text}"
 
 
-async def _send_or_edit_status(message: Message, state: FSMContext, text: str) -> int:
-    data = await state.get_data()
-    status_message_id = data.get("status_message_id")
+async def _send_or_edit_progress(message: Message, task_id: int, text: str) -> int:
+    with SessionLocal() as session:
+        task = get_task(session, task_id)
+        status_message_id = task.progress_message_id if task else None
     if status_message_id:
         try:
             await message.bot.edit_message_text(
@@ -71,48 +62,14 @@ async def _send_or_edit_status(message: Message, state: FSMContext, text: str) -
         except Exception as exc:
             logger.warning("Не удалось обновить статусное сообщение: %s", exc)
     new_message = await message.answer(text)
-    await state.update_data(status_message_id=new_message.message_id)
+    with SessionLocal() as session:
+        update_task(
+            session,
+            task_id,
+            progress_chat_id=message.chat.id,
+            progress_message_id=new_message.message_id,
+        )
     return new_message.message_id
-
-
-async def _generate_lyrics(preset: dict, brief: str) -> str:
-    system_text = _load_prompt("grok_lyrics_system_ru.txt")
-    user_template = _load_prompt("grok_lyrics_user_template.txt")
-    user_text = _render_template(
-        user_template,
-        preset_title=preset["title"],
-        preset_description=preset["description"],
-        mood=preset["hints"]["mood"],
-        vibe=preset["hints"]["vibe"],
-        genre=preset["hints"]["genre"],
-        short_form=str(preset["short_form"]).lower(),
-        recommendations=preset["recommendations"],
-        brief=brief,
-    )
-    return call_grok(_build_grok_messages(system_text, user_text))
-
-
-async def _generate_tags(preset: dict, lyrics: str) -> str:
-    system_text = _load_prompt("grok_tags_system_ru.txt")
-    user_template = _load_prompt("grok_tags_user_template.txt")
-    user_text = _render_template(
-        user_template,
-        preset_title=preset["title"],
-        preset_description=preset["description"],
-        mood=preset["hints"]["mood"],
-        vibe=preset["hints"]["vibe"],
-        genre=preset["hints"]["genre"],
-        short_form=str(preset["short_form"]).lower(),
-        lyrics=lyrics,
-    )
-    return call_grok(_build_grok_messages(system_text, user_text))
-
-
-async def _generate_edit(lyrics: str, edit_request: str) -> str:
-    system_text = _load_prompt("grok_edit_system_ru.txt")
-    user_template = _load_prompt("grok_edit_user_template.txt")
-    user_text = _render_template(user_template, lyrics=lyrics, edit_request=edit_request)
-    return call_grok(_build_grok_messages(system_text, user_text))
 
 
 def _consume_text_quota(user_id: int, paid_allowed: bool = False) -> tuple[bool, str]:
@@ -171,7 +128,7 @@ async def handle_brief(message: Message, state: FSMContext) -> None:
         return
 
     await state.update_data(brief=message.text)
-    await _generate_and_review(message, state, preset, message.text)
+    await _queue_text_generation(message, state, preset, message.text)
 
 
 @router.callback_query(lambda call: call.data == "textpay:confirm")
@@ -188,7 +145,7 @@ async def paid_text_confirm(call: CallbackQuery, state: FSMContext) -> None:
         await call.message.answer(_with_preset(preset, "Недостаточно средств на балансе."))
         await call.answer()
         return
-    await _generate_and_review(call.message, state, preset, brief)
+    await _queue_text_generation(call.message, state, preset, brief)
     await call.answer()
 
 
@@ -202,31 +159,50 @@ async def paid_text_wait(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer()
 
 
-async def _generate_and_review(message: Message, state: FSMContext, preset: dict, brief: str) -> None:
-    await _send_or_edit_status(
-        message,
-        state,
-        _with_preset(preset, "⏳ Генерирую текст (≈15 сек)…"),
-    )
-    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-    try:
-        lyrics = await _generate_lyrics(preset, brief)
-        tags = await _generate_tags(preset, lyrics)
-    except GenApiError as exc:
-        logger.error("Ошибка генерации текста: %s", exc)
-        await message.answer(_with_preset(preset, str(exc)))
-        return
-    await _send_or_edit_status(
-        message,
-        state,
-        _with_preset(preset, "✅ Текст готов. Можно править или утвердить."),
-    )
-    await state.update_data(lyrics=lyrics, tags=tags)
+async def _queue_text_generation(message: Message, state: FSMContext, preset: dict, brief: str) -> None:
+    status_message = await message.answer(_with_preset(preset, "⏳ Генерирую текст…"))
+    with SessionLocal() as session:
+        user = get_or_create_user(session, message.from_user.id)
+        task = create_task(
+            session,
+            user_id=user.id,
+            preset_id=preset["id"],
+            status=TEXT_QUEUED,
+            brief=brief,
+            progress_chat_id=message.chat.id,
+            progress_message_id=status_message.message_id,
+        )
+    await state.update_data(task_id=task.id, preset_id=preset["id"], brief=brief)
     await state.set_state(TrackStates.waiting_for_review)
-    await message.answer(
-        f"{_preset_line(preset)}\n\nТекст песни:\n\n{lyrics}\n\nТеги: {tags}",
-        reply_markup=review_keyboard(),
-    )
+    from app.worker.tasks import enqueue_text_generation
+
+    job_id = enqueue_text_generation(task.id)
+    logger.info("Текстовая генерация поставлена в очередь: %s", job_id)
+
+
+async def _queue_regeneration(message: Message, state: FSMContext, preset: dict, brief: str) -> None:
+    data = await state.get_data()
+    task_id = data.get("task_id")
+    if not task_id:
+        await message.answer("Данные не найдены. Начните заново.")
+        await state.clear()
+        return
+    await _send_or_edit_progress(message, task_id, _with_preset(preset, "⏳ Генерирую текст…"))
+    with SessionLocal() as session:
+        update_task(
+            session,
+            task_id,
+            status=TEXT_QUEUED,
+            brief=brief,
+            lyrics_current=None,
+            tags_current=None,
+            error_message=None,
+            genapi_request_id=None,
+        )
+    from app.worker.tasks import enqueue_text_generation
+
+    job_id = enqueue_text_generation(task_id)
+    logger.info("Повторная генерация поставлена в очередь: %s", job_id)
 
 
 @router.callback_query(lambda call: call.data.startswith("review:"))
@@ -241,12 +217,20 @@ async def review_actions(call: CallbackQuery, state: FSMContext) -> None:
         return
 
     if action == "approve":
+        task_id = data.get("task_id")
+        if task_id:
+            with SessionLocal() as session:
+                update_task(session, task_id, status=TITLE_WAITING)
         await state.set_state(TrackStates.waiting_for_title)
         await call.message.answer(
             f"{_preset_line(preset)}\n\n🎼 Введите название трека или нажмите 🎲 Автоназвание",
             reply_markup=title_keyboard(),
         )
     elif action == "edit":
+        task_id = data.get("task_id")
+        if task_id:
+            with SessionLocal() as session:
+                update_task(session, task_id, status=WAITING_EDIT_REQUEST)
         await state.set_state(TrackStates.waiting_for_edit)
         await call.message.answer(f"{_preset_line(preset)}\n\nНапишите, что поправить в тексте.")
     elif action == "regen":
@@ -261,8 +245,12 @@ async def review_actions(call: CallbackQuery, state: FSMContext) -> None:
             return
         brief = data.get("brief", "")
         await state.update_data(used_new_variant=True)
-        await _generate_and_review(call.message, state, preset, brief)
+        await _queue_regeneration(call.message, state, preset, brief)
     elif action == "cancel":
+        task_id = data.get("task_id")
+        if task_id:
+            with SessionLocal() as session:
+                update_task(session, task_id, status=CANCELED)
         await state.clear()
         await call.message.answer("Отмена. Выберите действие в меню.", reply_markup=main_menu())
     await call.answer()
@@ -272,31 +260,24 @@ async def review_actions(call: CallbackQuery, state: FSMContext) -> None:
 async def handle_edit(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     preset = get_preset(data.get("preset_id", ""))
-    lyrics = data.get("lyrics")
-    if not preset or not lyrics:
+    task_id = data.get("task_id")
+    if not preset or not task_id:
         await message.answer("Данные не найдены. Начните заново.")
         await state.clear()
         return
-    await _send_or_edit_status(message, state, _with_preset(preset, "⏳ Вношу правки (≈15 сек)…"))
-    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-    try:
-        new_lyrics = await _generate_edit(lyrics, message.text)
-        tags = await _generate_tags(preset, new_lyrics)
-    except GenApiError as exc:
-        logger.error("Ошибка правок текста: %s", exc)
-        await message.answer(_with_preset(preset, str(exc)))
-        return
-    await _send_or_edit_status(
-        message,
-        state,
-        _with_preset(preset, "✅ Текст готов. Можно править или утвердить."),
-    )
-    await state.update_data(lyrics=new_lyrics, tags=tags)
+    await _send_or_edit_progress(message, task_id, _with_preset(preset, "⏳ Применяю правки…"))
+    with SessionLocal() as session:
+        update_task(
+            session,
+            task_id,
+            status=EDIT_QUEUED,
+            edit_request=message.text,
+        )
     await state.set_state(TrackStates.waiting_for_review)
-    await message.answer(
-        f"{_preset_line(preset)}\n\nОбновлённый текст:\n\n{new_lyrics}\n\nТеги: {tags}",
-        reply_markup=review_keyboard(),
-    )
+    from app.worker.tasks import enqueue_edit_generation
+
+    job_id = enqueue_edit_generation(task_id)
+    logger.info("Правка поставлена в очередь: %s", job_id)
 
 
 @router.callback_query(lambda call: call.data == "title:auto")
@@ -332,8 +313,16 @@ async def handle_title(message: Message, state: FSMContext) -> None:
 
 async def _finalize_track(message: Message, state: FSMContext, preset: dict, title: str) -> None:
     data = await state.get_data()
-    lyrics = data.get("lyrics")
-    tags = data.get("tags")
+    task_id = data.get("task_id")
+    if not task_id:
+        await message.answer("Нет данных для генерации. Начните заново.")
+        await state.clear()
+        return
+    with SessionLocal() as session:
+        task = get_task(session, task_id)
+        lyrics = task.lyrics_current if task else None
+        tags = task.tags_current if task else None
+        update_task(session, task_id, status=TITLE_WAITING, title_text=title)
     if not lyrics or not tags:
         await message.answer("Нет данных для генерации. Начните заново.")
         await state.clear()
@@ -343,27 +332,32 @@ async def _finalize_track(message: Message, state: FSMContext, preset: dict, tit
         user = get_or_create_user(session, message.from_user.id)
         transaction = hold_audio(session, user, amount)
     if not transaction:
+        with SessionLocal() as session:
+            update_task(session, task_id, status=PAYMENT_WAITING)
         await message.answer(_with_preset(preset, "Недостаточно средств для аудио. Пополните баланс."))
         await state.clear()
         return
     status_message = await message.answer(
-        _with_preset(preset, "⏳ Генерирую аудио (≈3 минуты)…"),
+        _with_preset(preset, "⏳ Генерирую аудио…"),
         reply_markup=main_menu(),
     )
     await state.clear()
     from app.worker.tasks import enqueue_audio_generation
 
     job_id = enqueue_audio_generation(
-        user_id=user.id,
+        task_id=task_id,
         chat_id=message.chat.id,
-        preset_id=preset["id"],
-        preset_title=preset["title"],
-        title=title,
-        lyrics=lyrics,
-        tags=tags,
         transaction_id=transaction.id,
         status_message_id=status_message.message_id,
     )
+    with SessionLocal() as session:
+        update_task(
+            session,
+            task_id,
+            status=AUDIO_QUEUED,
+            progress_chat_id=message.chat.id,
+            progress_message_id=status_message.message_id,
+        )
     logger.info("Трек поставлен в очередь: %s", job_id)
 
 

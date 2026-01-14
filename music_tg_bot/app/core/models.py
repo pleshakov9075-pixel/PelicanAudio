@@ -50,3 +50,32 @@ class Track(Base):
     mp3_url_2: Mapped[str] = mapped_column(Text)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
     expires_at: Mapped[dt.datetime] = mapped_column(DateTime)
+
+
+class Task(Base):
+    __tablename__ = "tasks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    preset_id: Mapped[str] = mapped_column(String(64))
+    brief: Mapped[str | None] = mapped_column(Text, nullable=True)
+    edit_request: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(32))
+    stage: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    progress: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    progress_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    progress_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    genapi_request_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    suno_request_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mp3_url_1: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mp3_url_2: Mapped[str | None] = mapped_column(Text, nullable=True)
+    title_text: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lyrics_current: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tags_current: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime,
+        default=dt.datetime.utcnow,
+        onupdate=dt.datetime.utcnow,
+    )

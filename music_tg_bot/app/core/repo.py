@@ -5,7 +5,7 @@ import datetime as dt
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.models import User, Transaction, Track
+from app.core.models import User, Transaction, Track, Task
 
 
 FREE_QUOTA_PER_DAY = 3
@@ -134,3 +134,42 @@ def create_track(
     session.commit()
     session.refresh(track)
     return track
+
+
+def create_task(
+    session: Session,
+    user_id: int,
+    preset_id: str,
+    status: str,
+    brief: str | None = None,
+    progress_chat_id: int | None = None,
+    progress_message_id: int | None = None,
+) -> Task:
+    task = Task(
+        user_id=user_id,
+        preset_id=preset_id,
+        status=status,
+        brief=brief,
+        progress_chat_id=progress_chat_id,
+        progress_message_id=progress_message_id,
+    )
+    session.add(task)
+    session.commit()
+    session.refresh(task)
+    return task
+
+
+def get_task(session: Session, task_id: int) -> Task | None:
+    return session.get(Task, task_id)
+
+
+def update_task(session: Session, task_id: int, **fields: object) -> Task | None:
+    task = session.get(Task, task_id)
+    if not task:
+        return None
+    for key, value in fields.items():
+        setattr(task, key, value)
+    session.add(task)
+    session.commit()
+    session.refresh(task)
+    return task

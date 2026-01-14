@@ -13,9 +13,25 @@ from rq import Queue
 
 from app.core.config import settings
 from app.core.db import SessionLocal
-from app.core.repo import capture_audio, release_audio, create_track
+from app.core.generation import build_edit_messages, build_lyrics_messages, build_tags_messages
+from app.core.repo import capture_audio, release_audio, create_track, get_task, update_task
+from app.core.task_status import (
+    AUDIO_POLLING,
+    AUDIO_RUNNING,
+    DOWNLOADING_AUDIO,
+    EDIT_POLLING,
+    EDIT_RUNNING,
+    FAILED,
+    REVIEW_READY,
+    SENDING_DOCUMENT,
+    SUCCEEDED,
+    TAGS_RUNNING,
+    TEXT_POLLING,
+    TEXT_RUNNING,
+)
 from app.core.utils import sanitize_filename
-from app.integrations.genapi import call_suno, GenApiError
+from app.integrations.genapi import call_grok, call_suno, GenApiError
+from app.presets.loader import get_preset
 
 logger = logging.getLogger("worker.tasks")
 
@@ -41,27 +57,29 @@ def _get_queue() -> Queue:
     return Queue("default", connection=redis_conn)
 
 
+def enqueue_text_generation(task_id: int) -> str:
+    queue = _get_queue()
+    job = queue.enqueue(generate_text_task, task_id)
+    return job.id
+
+
+def enqueue_edit_generation(task_id: int) -> str:
+    queue = _get_queue()
+    job = queue.enqueue(generate_edit_task, task_id)
+    return job.id
+
+
 def enqueue_audio_generation(
-    user_id: int,
+    task_id: int,
     chat_id: int,
-    preset_id: str,
-    preset_title: str,
-    title: str,
-    lyrics: str,
-    tags: str,
     transaction_id: int,
     status_message_id: int | None,
 ) -> str:
     queue = _get_queue()
     job = queue.enqueue(
         generate_audio_task,
-        user_id,
+        task_id,
         chat_id,
-        preset_id,
-        preset_title,
-        title,
-        lyrics,
-        tags,
         transaction_id,
         status_message_id,
     )
@@ -76,38 +94,287 @@ def _download_file(url: str, target_path: Path) -> None:
                 handle.write(chunk)
 
 
-def generate_audio_task(
-    user_id: int,
+def _update_progress_message(
     chat_id: int,
-    preset_id: str,
-    preset_title: str,
-    title: str,
-    lyrics: str,
-    tags: str,
+    message_id: int | None,
+    text: str,
+) -> int:
+    async def _run() -> int:
+        bot = Bot(token=settings.bot_token)
+        try:
+            return await _send_or_edit_status(bot, chat_id, message_id, text)
+        finally:
+            await bot.session.close()
+
+    return asyncio.run(_run())
+
+
+def _store_message_id(task_id: int, message_id: int) -> None:
+    with SessionLocal() as session:
+        update_task(session, task_id, progress_message_id=message_id)
+
+
+def _load_task_and_preset(task_id: int) -> tuple[object | None, dict | None]:
+    with SessionLocal() as session:
+        task = get_task(session, task_id)
+        preset = get_preset(task.preset_id) if task else None
+    return task, preset
+
+
+def generate_text_task(task_id: int) -> None:
+    task, preset = _load_task_and_preset(task_id)
+    if not task or not preset:
+        return
+    status_prefix = f"🎛 Пресет: {preset['title']}"
+    with SessionLocal() as session:
+        update_task(session, task_id, status=TEXT_RUNNING)
+    status_message_id = _update_progress_message(
+        chat_id=task.progress_chat_id,
+        message_id=task.progress_message_id,
+        text=f"{status_prefix}\n⏳ Генерирую текст…",
+    )
+    _store_message_id(task_id, status_message_id)
+    try:
+        lyrics_result = call_grok(build_lyrics_messages(preset, task.brief or ""))
+        if lyrics_result.request_id is not None:
+            with SessionLocal() as session:
+                update_task(
+                    session,
+                    task_id,
+                    status=TEXT_POLLING,
+                    genapi_request_id=lyrics_result.request_id,
+                )
+            status_message_id = _update_progress_message(
+                chat_id=task.progress_chat_id,
+                message_id=status_message_id,
+                text=f"{status_prefix}\n⏳ Генерирую текст… (polling)",
+            )
+            _store_message_id(task_id, status_message_id)
+        lyrics = lyrics_result.result
+        with SessionLocal() as session:
+            update_task(session, task_id, lyrics_current=lyrics, status=TAGS_RUNNING, genapi_request_id=None)
+        status_message_id = _update_progress_message(
+            chat_id=task.progress_chat_id,
+            message_id=status_message_id,
+            text=f"{status_prefix}\n✅ Текст готов. Генерирую теги…",
+        )
+        _store_message_id(task_id, status_message_id)
+        tags_result = call_grok(build_tags_messages(preset, lyrics))
+        if tags_result.request_id is not None:
+            with SessionLocal() as session:
+                update_task(
+                    session,
+                    task_id,
+                    status=TAGS_RUNNING,
+                    genapi_request_id=tags_result.request_id,
+                )
+            status_message_id = _update_progress_message(
+                chat_id=task.progress_chat_id,
+                message_id=status_message_id,
+                text=f"{status_prefix}\n⏳ Генерирую теги… (polling)",
+            )
+            _store_message_id(task_id, status_message_id)
+        tags = tags_result.result
+        with SessionLocal() as session:
+            update_task(
+                session,
+                task_id,
+                status=REVIEW_READY,
+                tags_current=tags,
+                genapi_request_id=None,
+            )
+        status_message_id = _update_progress_message(
+            chat_id=task.progress_chat_id,
+            message_id=status_message_id,
+            text=f"{status_prefix}\n✅ Готово. Проверь текст ниже:",
+        )
+        _store_message_id(task_id, status_message_id)
+        async def _send_review() -> None:
+            from app.bot.keyboards.inline import review_keyboard
+
+            bot = Bot(token=settings.bot_token)
+            try:
+                await bot.send_message(
+                    chat_id=task.progress_chat_id,
+                    text=f"{status_prefix}\n\nТекст песни:\n\n{lyrics}\n\nТеги: {tags}",
+                    reply_markup=review_keyboard(),
+                )
+            finally:
+                await bot.session.close()
+
+        asyncio.run(_send_review())
+    except GenApiError as exc:
+        logger.error("Ошибка генерации текста: %s", exc)
+        with SessionLocal() as session:
+            update_task(session, task_id, status=FAILED, error_message=str(exc))
+        _update_progress_message(
+            chat_id=task.progress_chat_id,
+            message_id=status_message_id,
+            text=f"{status_prefix}\n{exc}",
+        )
+
+
+def generate_edit_task(task_id: int) -> None:
+    task, preset = _load_task_and_preset(task_id)
+    if not task or not preset:
+        return
+    status_prefix = f"🎛 Пресет: {preset['title']}"
+    with SessionLocal() as session:
+        update_task(session, task_id, status=EDIT_RUNNING)
+    status_message_id = _update_progress_message(
+        chat_id=task.progress_chat_id,
+        message_id=task.progress_message_id,
+        text=f"{status_prefix}\n⏳ Применяю правки…",
+    )
+    _store_message_id(task_id, status_message_id)
+    try:
+        edit_result = call_grok(build_edit_messages(task.lyrics_current or "", task.edit_request or ""))
+        if edit_result.request_id is not None:
+            with SessionLocal() as session:
+                update_task(
+                    session,
+                    task_id,
+                    status=EDIT_POLLING,
+                    genapi_request_id=edit_result.request_id,
+                )
+            status_message_id = _update_progress_message(
+                chat_id=task.progress_chat_id,
+                message_id=status_message_id,
+                text=f"{status_prefix}\n⏳ Применяю правки… (polling)",
+            )
+            _store_message_id(task_id, status_message_id)
+        new_lyrics = edit_result.result
+        with SessionLocal() as session:
+            update_task(
+                session,
+                task_id,
+                lyrics_current=new_lyrics,
+                tags_current=None,
+                status=TAGS_RUNNING,
+                genapi_request_id=None,
+            )
+        status_message_id = _update_progress_message(
+            chat_id=task.progress_chat_id,
+            message_id=status_message_id,
+            text=f"{status_prefix}\n✅ Текст обновлён. Генерирую теги…",
+        )
+        _store_message_id(task_id, status_message_id)
+        tags_result = call_grok(build_tags_messages(preset, new_lyrics))
+        if tags_result.request_id is not None:
+            with SessionLocal() as session:
+                update_task(
+                    session,
+                    task_id,
+                    status=TAGS_RUNNING,
+                    genapi_request_id=tags_result.request_id,
+                )
+            status_message_id = _update_progress_message(
+                chat_id=task.progress_chat_id,
+                message_id=status_message_id,
+                text=f"{status_prefix}\n⏳ Генерирую теги… (polling)",
+            )
+            _store_message_id(task_id, status_message_id)
+        tags = tags_result.result
+        with SessionLocal() as session:
+            update_task(
+                session,
+                task_id,
+                status=REVIEW_READY,
+                tags_current=tags,
+                genapi_request_id=None,
+            )
+        status_message_id = _update_progress_message(
+            chat_id=task.progress_chat_id,
+            message_id=status_message_id,
+            text=f"{status_prefix}\n✅ Готово. Проверь текст ниже:",
+        )
+        _store_message_id(task_id, status_message_id)
+        async def _send_review() -> None:
+            from app.bot.keyboards.inline import review_keyboard
+
+            bot = Bot(token=settings.bot_token)
+            try:
+                await bot.send_message(
+                    chat_id=task.progress_chat_id,
+                    text=f"{status_prefix}\n\nОбновлённый текст:\n\n{new_lyrics}\n\nТеги: {tags}",
+                    reply_markup=review_keyboard(),
+                )
+            finally:
+                await bot.session.close()
+
+        asyncio.run(_send_review())
+    except GenApiError as exc:
+        logger.error("Ошибка правок текста: %s", exc)
+        with SessionLocal() as session:
+            update_task(session, task_id, status=FAILED, error_message=str(exc))
+        _update_progress_message(
+            chat_id=task.progress_chat_id,
+            message_id=status_message_id,
+            text=f"{status_prefix}\n{exc}",
+        )
+
+
+def generate_audio_task(
+    task_id: int,
+    chat_id: int,
     transaction_id: int,
     status_message_id: int | None,
 ) -> None:
+    task, preset = _load_task_and_preset(task_id)
+    if not task or not preset:
+        return
     logger.info("Старт генерации аудио", extra={"request_id": str(transaction_id)})
-    status_text_prefix = f"🎛 Пресет: {preset_title}"
+    status_text_prefix = f"🎛 Пресет: {preset['title']}"
     try:
-        urls = call_suno(title=title, tags=tags, prompt=lyrics)
+        with SessionLocal() as session:
+            update_task(session, task_id, status=AUDIO_RUNNING)
+        status_message_id = _update_progress_message(
+            chat_id=chat_id,
+            message_id=status_message_id,
+            text=f"{status_text_prefix}\n⏳ Генерирую аудио…",
+        )
+        _store_message_id(task_id, status_message_id)
+        suno_result = call_suno(title=task.title_text or "", tags=task.tags_current or "", prompt=task.lyrics_current or "")
+        if suno_result.request_id is not None:
+            with SessionLocal() as session:
+                update_task(
+                    session,
+                    task_id,
+                    status=AUDIO_POLLING,
+                    suno_request_id=suno_result.request_id,
+                )
+            status_message_id = _update_progress_message(
+                chat_id=chat_id,
+                message_id=status_message_id,
+                text=f"{status_text_prefix}\n⏳ Генерирую аудио… (polling)",
+            )
+            _store_message_id(task_id, status_message_id)
+        urls = suno_result.result
         mp3_url_1, mp3_url_2 = urls[0], urls[1]
         with SessionLocal() as session:
             track = create_track(
                 session,
-                user_id=user_id,
-                preset_id=preset_id,
-                title=title,
-                lyrics=lyrics,
-                tags=tags,
+                user_id=task.user_id,
+                preset_id=task.preset_id,
+                title=task.title_text or "",
+                lyrics=task.lyrics_current or "",
+                tags=task.tags_current or "",
                 mp3_url_1=mp3_url_1,
                 mp3_url_2=mp3_url_2,
+            )
+            update_task(
+                session,
+                task_id,
+                mp3_url_1=mp3_url_1,
+                mp3_url_2=mp3_url_2,
+                suno_request_id=None,
             )
             capture_audio(session, transaction_id)
     except GenApiError as exc:
         logger.error("Ошибка Suno: %s", exc)
         with SessionLocal() as session:
             release_audio(session, transaction_id)
+            update_task(session, task_id, status=FAILED, error_message=str(exc))
         async def _notify_failure() -> None:
             bot = Bot(token=settings.bot_token)
             try:
@@ -125,7 +392,7 @@ def generate_audio_task(
 
     tmp_dir = Path(settings.storage_dir) / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    filename = sanitize_filename(title)
+    filename = sanitize_filename(task.title_text or "Трек")
     file_path = tmp_dir / f"{filename}.mp3"
 
     async def _set_status_downloading() -> None:
@@ -142,29 +409,37 @@ def generate_audio_task(
             await bot.session.close()
 
     asyncio.run(_set_status_downloading())
+    with SessionLocal() as session:
+        update_task(session, task_id, status=DOWNLOADING_AUDIO, progress_message_id=status_message_id)
 
     try:
         _download_file(mp3_url_1, file_path)
     except Exception as exc:
         logger.error("Ошибка загрузки mp3: %s", exc)
+        with SessionLocal() as session:
+            update_task(session, task_id, status=FAILED, error_message=str(exc))
         return
 
     async def _send() -> None:
         bot = Bot(token=settings.bot_token)
+        with SessionLocal() as session:
+            update_task(session, task_id, status=SENDING_DOCUMENT)
         await bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
         await bot.send_document(
             chat_id=chat_id,
             document=FSInputFile(file_path),
-            caption=f"{status_text_prefix}\n✅ Готово! Вот ваш трек: {title}",
+            caption=f"{status_text_prefix}\n✅ Готово! Вот ваш трек: {task.title_text}",
             reply_markup=second_variant_keyboard(track.id),
         )
         await _send_or_edit_status(
             bot,
             chat_id,
             status_message_id,
-            f"{status_text_prefix}\n✅ Готово! Вот ваш трек: {title}",
+            f"{status_text_prefix}\n✅ Готово! Вот ваш трек: {task.title_text}",
         )
         await bot.session.close()
+        with SessionLocal() as session:
+            update_task(session, task_id, status=SUCCEEDED)
 
     from app.bot.keyboards.inline import second_variant_keyboard
 
