@@ -343,7 +343,7 @@ async def review_actions(call: CallbackQuery, state: FSMContext) -> None:
         task_id = data.get("task_id")
         if task_id:
             with SessionLocal() as session:
-            update_task(session, task_id, status=WAITING_EDIT_REQUEST)
+                update_task(session, task_id, status=WAITING_EDIT_REQUEST)
         await state.set_state(TrackStates.waiting_for_edit)
         await call.message.answer(f"{_preset_line(preset)}\n\nНапишите, что поправить в тексте.")
     elif action == "regen":
