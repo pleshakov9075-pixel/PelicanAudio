@@ -113,21 +113,46 @@ def _request_with_retries(
 
 
 def _parse_grok_response(data: Any) -> str:
-    try:
-        return data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as exc:
-        logger.error("Неожиданный ответ GenAPI: %s", data)
-        raise GenApiError("Неожиданный ответ GenAPI") from exc
+    payload, branch = _unwrap_payload(data)
+    if branch:
+        logger.info("GenAPI grok: извлечён вложенный payload из '%s'", branch)
+    if isinstance(payload, str):
+        logger.info("GenAPI grok: получен текст напрямую")
+        return payload
+    if isinstance(payload, dict) and "choices" in payload:
+        try:
+            logger.info("GenAPI grok: парсинг через choices")
+            return payload["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            logger.error("Неожиданный ответ GenAPI (choices): %s", list(payload.keys()))
+            raise GenApiError("Неожиданный ответ GenAPI") from exc
+    if isinstance(payload, dict) and "text" in payload:
+        logger.info("GenAPI grok: парсинг через text")
+        return str(payload["text"])
+    logger.error("Неожиданный ответ GenAPI (grok): %s", _payload_brief(payload))
+    raise GenApiError("Неожиданный ответ GenAPI")
 
 
 def _parse_suno_response(data: Any) -> list[str]:
-    if not isinstance(data, list) or len(data) < 2:
-        raise GenApiError("Неожиданный ответ Suno")
-    return data
+    payload, branch = _unwrap_payload(data)
+    if branch:
+        logger.info("GenAPI suno: извлечён вложенный payload из '%s'", branch)
+    if isinstance(payload, list):
+        urls = _extract_urls_from_list(payload)
+        if len(urls) >= 2:
+            logger.info("GenAPI suno: парсинг списка")
+            return urls[:2]
+    if isinstance(payload, dict):
+        urls = _extract_urls_from_dict(payload)
+        if len(urls) >= 2:
+            logger.info("GenAPI suno: парсинг словаря")
+            return urls[:2]
+    logger.error("Неожиданный ответ Suno: %s", _payload_brief(payload))
+    raise GenApiError("Неожиданный ответ Suno")
 
 
 def _maybe_processing(data: Any) -> tuple[bool, int | None]:
-    if isinstance(data, dict) and data.get("status") == "processing":
+    if isinstance(data, dict) and data.get("status") in {"processing", "queued", "pending", "running"}:
         return True, data.get("request_id")
     return False, None
 
@@ -136,6 +161,51 @@ def _raise_if_failed(data: Any) -> None:
     if isinstance(data, dict) and data.get("status") in {"failed", "error"}:
         message = data.get("error") or data.get("message") or "Ошибка GenAPI"
         raise GenApiError(message)
+
+
+def _payload_brief(data: Any) -> str:
+    if isinstance(data, dict):
+        return f"keys={list(data.keys())}"
+    if isinstance(data, list):
+        return f"list(len={len(data)})"
+    return f"type={type(data).__name__}"
+
+
+def _unwrap_payload(data: Any) -> tuple[Any, str | None]:
+    if isinstance(data, dict):
+        for key in ("response", "result", "data", "payload"):
+            if key in data:
+                return data[key], key
+    return data, None
+
+
+def _extract_urls_from_list(data: list[Any]) -> list[str]:
+    urls: list[str] = []
+    for item in data:
+        if isinstance(item, str):
+            urls.append(item)
+            continue
+        if isinstance(item, dict):
+            url = item.get("audio_url") or item.get("url") or item.get("mp3_url")
+            if url:
+                urls.append(str(url))
+    return urls
+
+
+def _extract_urls_from_dict(data: dict[str, Any]) -> list[str]:
+    urls: list[str] = []
+    for key in ("audio_url_1", "audio_url_2", "mp3_url_1", "mp3_url_2"):
+        if data.get(key):
+            urls.append(str(data[key]))
+    if len(urls) >= 2:
+        return urls
+    for key in ("audio_url", "mp3_url"):
+        if data.get(key):
+            urls.append(str(data[key]))
+    clips = data.get("clips")
+    if isinstance(clips, list):
+        urls.extend(_extract_urls_from_list(clips))
+    return urls
 
 
 def _poll_request(
@@ -153,8 +223,16 @@ def _poll_request(
         response = _request_with_retries("GET", url, None, timeout, operation)
         data = response.json()
         if isinstance(data, dict):
+            logger.info(
+                "GenAPI polling %s: status=%s keys=%s request_id=%s",
+                operation,
+                data.get("status"),
+                list(data.keys()),
+                request_id,
+            )
+        if isinstance(data, dict):
             status = data.get("status")
-            if status == "processing":
+            if status in {"processing", "queued", "pending", "running"}:
                 attempt += 1
                 sleep_seconds = min(1.0 + 0.5 * attempt, 2.0)
                 time.sleep(sleep_seconds)
@@ -182,11 +260,14 @@ def call_grok(messages: list[dict[str, Any]]) -> GenApiResult:
     timeout = _timeout(settings.genapi_timeout_connect, settings.genapi_timeout_read_grok)
     response = _request_with_retries("POST", url, payload, timeout, "grok")
     data = response.json()
+    if isinstance(data, dict):
+        logger.info("GenAPI grok: initial keys=%s status=%s", list(data.keys()), data.get("status"))
     _raise_if_failed(data)
     is_processing, request_id = _maybe_processing(data)
     if is_processing and not request_id:
         raise GenApiError("Неожиданный ответ GenAPI без request_id")
     if is_processing and request_id:
+        logger.info("GenAPI grok: request_id=%s status=processing", request_id)
         data = _poll_request(request_id, 90, timeout, "grok")
     return GenApiResult(result=_parse_grok_response(data), request_id=request_id)
 
@@ -204,10 +285,13 @@ def call_suno(title: str, tags: str, prompt: str) -> GenApiResult:
     timeout = _timeout(settings.genapi_timeout_connect, settings.genapi_timeout_read_suno)
     response = _request_with_retries("POST", url, payload, timeout, "suno")
     data = response.json()
+    if isinstance(data, dict):
+        logger.info("GenAPI suno: initial keys=%s status=%s", list(data.keys()), data.get("status"))
     _raise_if_failed(data)
     is_processing, request_id = _maybe_processing(data)
     if is_processing and not request_id:
         raise GenApiError("Неожиданный ответ GenAPI без request_id")
     if is_processing and request_id:
+        logger.info("GenAPI suno: request_id=%s status=processing", request_id)
         data = _poll_request(request_id, 180, timeout, "suno")
     return GenApiResult(result=_parse_suno_response(data), request_id=request_id)

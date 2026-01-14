@@ -45,10 +45,21 @@ async def _send_or_edit_status(
     if message_id:
         try:
             await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
+            logger.info(
+                "Статусное сообщение обновлено",
+                extra={"chat_id": chat_id, "message_id": message_id},
+            )
             return message_id
         except Exception as exc:
-            logger.warning("Не удалось обновить статусное сообщение: %s", exc)
+            logger.exception(
+                "Не удалось обновить статусное сообщение",
+                extra={"chat_id": chat_id, "message_id": message_id},
+            )
     sent = await bot.send_message(chat_id=chat_id, text=text)
+    logger.info(
+        "Статусное сообщение отправлено",
+        extra={"chat_id": chat_id, "message_id": sent.message_id},
+    )
     return sent.message_id
 
 
@@ -102,6 +113,10 @@ def _update_progress_message(
     async def _run() -> int:
         bot = Bot(token=settings.bot_token)
         try:
+            logger.info(
+                "Обновление прогресса",
+                extra={"chat_id": chat_id, "message_id": message_id},
+            )
             return await _send_or_edit_status(bot, chat_id, message_id, text)
         finally:
             await bot.session.close()
@@ -125,6 +140,15 @@ def generate_text_task(task_id: int) -> None:
     task, preset = _load_task_and_preset(task_id)
     if not task or not preset:
         return
+    logger.info(
+        "Старт генерации текста",
+        extra={
+            "task_id": task_id,
+            "chat_id": task.progress_chat_id,
+            "message_id": task.progress_message_id,
+            "user_id": task.user_id,
+        },
+    )
     status_prefix = f"🎛 Пресет: {preset['title']}"
     with SessionLocal() as session:
         update_task(session, task_id, status=TEXT_RUNNING)
@@ -199,12 +223,23 @@ def generate_text_task(task_id: int) -> None:
                     text=f"{status_prefix}\n\nТекст песни:\n\n{lyrics}\n\nТеги: {tags}",
                     reply_markup=review_keyboard(),
                 )
+                logger.info(
+                    "Сообщение с ревью текста отправлено",
+                    extra={
+                        "task_id": task_id,
+                        "chat_id": task.progress_chat_id,
+                        "user_id": task.user_id,
+                    },
+                )
             finally:
                 await bot.session.close()
 
         asyncio.run(_send_review())
     except GenApiError as exc:
-        logger.error("Ошибка генерации текста: %s", exc)
+        logger.error(
+            "Ошибка генерации текста",
+            extra={"task_id": task_id, "chat_id": task.progress_chat_id, "user_id": task.user_id},
+        )
         with SessionLocal() as session:
             update_task(session, task_id, status=FAILED, error_message=str(exc))
         _update_progress_message(
@@ -218,6 +253,15 @@ def generate_edit_task(task_id: int) -> None:
     task, preset = _load_task_and_preset(task_id)
     if not task or not preset:
         return
+    logger.info(
+        "Старт правок текста",
+        extra={
+            "task_id": task_id,
+            "chat_id": task.progress_chat_id,
+            "message_id": task.progress_message_id,
+            "user_id": task.user_id,
+        },
+    )
     status_prefix = f"🎛 Пресет: {preset['title']}"
     with SessionLocal() as session:
         update_task(session, task_id, status=EDIT_RUNNING)
@@ -299,12 +343,23 @@ def generate_edit_task(task_id: int) -> None:
                     text=f"{status_prefix}\n\nОбновлённый текст:\n\n{new_lyrics}\n\nТеги: {tags}",
                     reply_markup=review_keyboard(),
                 )
+                logger.info(
+                    "Сообщение с ревью правок отправлено",
+                    extra={
+                        "task_id": task_id,
+                        "chat_id": task.progress_chat_id,
+                        "user_id": task.user_id,
+                    },
+                )
             finally:
                 await bot.session.close()
 
         asyncio.run(_send_review())
     except GenApiError as exc:
-        logger.error("Ошибка правок текста: %s", exc)
+        logger.error(
+            "Ошибка правок текста",
+            extra={"task_id": task_id, "chat_id": task.progress_chat_id, "user_id": task.user_id},
+        )
         with SessionLocal() as session:
             update_task(session, task_id, status=FAILED, error_message=str(exc))
         _update_progress_message(
@@ -323,7 +378,16 @@ def generate_audio_task(
     task, preset = _load_task_and_preset(task_id)
     if not task or not preset:
         return
-    logger.info("Старт генерации аудио", extra={"request_id": str(transaction_id)})
+    logger.info(
+        "Старт генерации аудио",
+        extra={
+            "task_id": task_id,
+            "chat_id": chat_id,
+            "message_id": status_message_id,
+            "user_id": task.user_id,
+            "transaction_id": transaction_id,
+        },
+    )
     status_text_prefix = f"🎛 Пресет: {preset['title']}"
     try:
         with SessionLocal() as session:
@@ -371,7 +435,10 @@ def generate_audio_task(
             )
             capture_audio(session, transaction_id)
     except GenApiError as exc:
-        logger.error("Ошибка Suno: %s", exc)
+        logger.error(
+            "Ошибка Suno",
+            extra={"task_id": task_id, "chat_id": chat_id, "user_id": task.user_id},
+        )
         with SessionLocal() as session:
             release_audio(session, transaction_id)
             update_task(session, task_id, status=FAILED, error_message=str(exc))
@@ -415,31 +482,66 @@ def generate_audio_task(
     try:
         _download_file(mp3_url_1, file_path)
     except Exception as exc:
-        logger.error("Ошибка загрузки mp3: %s", exc)
+        logger.exception(
+            "Ошибка загрузки mp3",
+            extra={"task_id": task_id, "chat_id": chat_id, "user_id": task.user_id},
+        )
         with SessionLocal() as session:
             update_task(session, task_id, status=FAILED, error_message=str(exc))
+        async def _notify_download_error() -> None:
+            bot = Bot(token=settings.bot_token)
+            try:
+                await _send_or_edit_status(
+                    bot,
+                    chat_id,
+                    status_message_id,
+                    f"{status_text_prefix}\n⚠️ Не удалось скачать аудио, попробуйте позже.",
+                )
+            finally:
+                await bot.session.close()
+
+        asyncio.run(_notify_download_error())
         return
 
     async def _send() -> None:
         bot = Bot(token=settings.bot_token)
-        with SessionLocal() as session:
-            update_task(session, task_id, status=SENDING_DOCUMENT)
-        await bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
-        await bot.send_document(
-            chat_id=chat_id,
-            document=FSInputFile(file_path),
-            caption=f"{status_text_prefix}\n✅ Готово! Вот ваш трек: {task.title_text}",
-            reply_markup=second_variant_keyboard(track.id),
-        )
-        await _send_or_edit_status(
-            bot,
-            chat_id,
-            status_message_id,
-            f"{status_text_prefix}\n✅ Готово! Вот ваш трек: {task.title_text}",
-        )
-        await bot.session.close()
-        with SessionLocal() as session:
-            update_task(session, task_id, status=SUCCEEDED)
+        try:
+            with SessionLocal() as session:
+                update_task(session, task_id, status=SENDING_DOCUMENT)
+            await bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+            await bot.send_document(
+                chat_id=chat_id,
+                document=FSInputFile(file_path),
+                caption=f"{status_text_prefix}\n✅ Готово! Вот ваш трек: {task.title_text}",
+                reply_markup=second_variant_keyboard(track.id),
+            )
+            logger.info(
+                "Аудио отправлено в Telegram",
+                extra={"task_id": task_id, "chat_id": chat_id, "user_id": task.user_id},
+            )
+            await _send_or_edit_status(
+                bot,
+                chat_id,
+                status_message_id,
+                f"{status_text_prefix}\n✅ Готово! Вот ваш трек: {task.title_text}",
+            )
+            with SessionLocal() as session:
+                update_task(session, task_id, status=SUCCEEDED)
+        except Exception as exc:
+            logger.exception(
+                "Ошибка отправки аудио в Telegram",
+                extra={"task_id": task_id, "chat_id": chat_id, "user_id": task.user_id},
+            )
+            with SessionLocal() as session:
+                update_task(session, task_id, status=FAILED, error_message=str(exc))
+            await _send_or_edit_status(
+                bot,
+                chat_id,
+                status_message_id,
+                f"{status_text_prefix}\n⚠️ Не удалось отправить аудио в Telegram.",
+            )
+        finally:
+            await bot.session.close()
 
     from app.bot.keyboards.inline import second_variant_keyboard
 
