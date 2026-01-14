@@ -14,6 +14,10 @@ def setup_logging(level: str = "INFO") -> None:
         ),
         handlers=[logging.StreamHandler(sys.stdout)],
     )
+    root_logger = logging.getLogger()
+    request_id_filter = RequestIdFilter()
+    for handler in root_logger.handlers:
+        handler.addFilter(request_id_filter)
 
 
 class RequestIdFilter(logging.Filter):
@@ -22,7 +26,8 @@ class RequestIdFilter(logging.Filter):
         self.request_id = request_id
 
     def filter(self, record: logging.LogRecord) -> bool:
-        record.request_id = self.request_id or "-"
+        if not hasattr(record, "request_id"):
+            record.request_id = self.request_id or "-"
         return True
 
 
