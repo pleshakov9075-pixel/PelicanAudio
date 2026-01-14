@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-from sqlalchemy import String, Integer, Date, DateTime, ForeignKey, UniqueConstraint, Text
+from sqlalchemy import BigInteger, String, Integer, Date, DateTime, ForeignKey, UniqueConstraint, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.db import Base
@@ -12,7 +12,7 @@ class User(Base):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    tg_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    tg_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
     balance_rub: Mapped[int] = mapped_column(Integer, default=0)
     free_quota_date: Mapped[dt.date] = mapped_column(Date, default=dt.date.today)
     free_quota_used: Mapped[int] = mapped_column(Integer, default=0)
