@@ -16,10 +16,11 @@ from app.bot.keyboards.reply import main_menu
 from app.bot.fsm.states import TrackStates
 from app.core.db import SessionLocal
 from app.core.repo import (
+    adjust_balance,
     get_or_create_user,
+    get_balance,
     consume_free_quota,
     charge_text,
-    hold_audio,
     create_task,
     get_task,
     update_task,
@@ -51,12 +52,21 @@ _EDIT_CANCEL_KEYWORDS = {
 }
 
 
-def _preset_line(preset: dict) -> str:
-    return f"🎛 Пресет: {preset['title']}\nЦена аудио: {preset['price_audio_rub']} ₽"
+def _preset_line(preset: dict, balance: int | None = None) -> str:
+    line = f"🎛 Пресет: {preset['title']}\nЦена аудио: {preset['price_audio_rub']} ₽"
+    if balance is not None:
+        line = f"{line}\nБаланс: {balance} ₽"
+    return line
 
 
-def _with_preset(preset: dict, text: str) -> str:
-    return f"{_preset_line(preset)}\n{text}"
+def _with_preset(preset: dict, text: str, balance: int | None = None) -> str:
+    return f"{_preset_line(preset, balance=balance)}\n{text}"
+
+
+def _get_user_balance(user_id: int) -> int:
+    with SessionLocal() as session:
+        user = get_or_create_user(session, user_id)
+        return user.balance_rub
 
 
 def _is_edit_cancel(text: str | None) -> bool:
@@ -132,24 +142,25 @@ async def preset_selected(call: CallbackQuery, state: FSMContext) -> None:
         await call.message.answer("Пресет не найден.")
         await call.answer()
         return
+    balance = _get_user_balance(call.from_user.id)
     await state.update_data(preset_id=preset_id, used_new_variant=False)
     mode = preset.get("mode", "song")
     if mode == "user_lyrics":
         await state.set_state(TrackStates.waiting_for_user_lyrics_brief)
         await call.message.answer(
-            f"{_preset_line(preset)}\n\nОтправьте одним сообщением стиль, настроение и жанр.",
+            f"{_preset_line(preset, balance=balance)}\n\nОтправьте одним сообщением стиль, настроение и жанр.",
             reply_markup=main_menu(),
         )
     elif mode == "instrumental":
         await state.set_state(TrackStates.waiting_for_brief)
         await call.message.answer(
-            f"{_preset_line(preset)}\n\nОпишите инструментал: настроение, темп, инструменты, где будет играть.",
+            f"{_preset_line(preset, balance=balance)}\n\nОпишите инструментал: настроение, темп, инструменты, где будет играть.",
             reply_markup=main_menu(),
         )
     else:
         await state.set_state(TrackStates.waiting_for_brief)
         await call.message.answer(
-            f"{_preset_line(preset)}\n\nОтправьте одним сообщением вводные для песни (brief).",
+            f"{_preset_line(preset, balance=balance)}\n\nОтправьте одним сообщением вводные для песни (brief).",
             reply_markup=main_menu(),
         )
     await call.answer()
@@ -332,7 +343,7 @@ async def review_actions(call: CallbackQuery, state: FSMContext) -> None:
         task_id = data.get("task_id")
         if task_id:
             with SessionLocal() as session:
-                update_task(session, task_id, status=WAITING_EDIT_REQUEST)
+            update_task(session, task_id, status=WAITING_EDIT_REQUEST)
         await state.set_state(TrackStates.waiting_for_edit)
         await call.message.answer(f"{_preset_line(preset)}\n\nНапишите, что поправить в тексте.")
     elif action == "regen":
@@ -373,8 +384,7 @@ async def handle_edit(message: Message, state: FSMContext) -> None:
             lyrics = task.lyrics_current if task else None
             tags = task.tags_current if task else None
             update_task(session, task_id, status=REVIEW_READY, edit_request=None)
-            user = get_or_create_user(session, message.from_user.id)
-            balance = user.balance_rub
+            balance = get_balance(session, message.from_user.id)
         if not lyrics or not tags:
             await message.answer("Нет данных для ревью. Начните заново.")
             await state.clear()
@@ -468,10 +478,13 @@ async def _finalize_track(message: Message, state: FSMContext, preset: dict, tit
         return
     amount = preset["price_audio_rub"]
     with SessionLocal() as session:
-        user = get_or_create_user(session, message.from_user.id)
-        balance = user.balance_rub
-        transaction = hold_audio(session, user, amount)
-    if not transaction:
+        balance = get_balance(session, message.from_user.id)
+        try:
+            adjust_balance(session, message.from_user.id, -amount, "spend_audio", task_id=task_id)
+            charged = True
+        except ValueError:
+            charged = False
+    if not charged:
         with SessionLocal() as session:
             update_task(session, task_id, status=PAYMENT_WAITING)
         await message.answer(
@@ -492,7 +505,6 @@ async def _finalize_track(message: Message, state: FSMContext, preset: dict, tit
     job_id = enqueue_audio_generation(
         task_id=task_id,
         chat_id=message.chat.id,
-        transaction_id=transaction.id,
         status_message_id=status_message.message_id,
     )
     with SessionLocal() as session:

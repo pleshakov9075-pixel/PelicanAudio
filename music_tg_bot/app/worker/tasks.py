@@ -21,7 +21,8 @@ from app.core.generation import (
     build_tags_messages,
     build_user_lyrics_messages,
 )
-from app.core.repo import capture_audio, release_audio, create_track, get_task, update_task
+from app.core.models import User
+from app.core.repo import adjust_balance, create_track, get_task, update_task
 from app.core.task_status import (
     AUDIO_POLLING,
     AUDIO_RUNNING,
@@ -41,6 +42,8 @@ from app.integrations.genapi import call_grok, call_suno, GenApiError
 from app.presets.loader import get_preset
 
 logger = logging.getLogger("worker.tasks")
+
+LYRICS_MESSAGE_LIMIT = 3500
 
 
 def _parse_instrumental_result(result: str) -> tuple[str | None, str]:
@@ -123,7 +126,6 @@ def enqueue_edit_generation(task_id: int) -> str:
 def enqueue_audio_generation(
     task_id: int,
     chat_id: int,
-    transaction_id: int,
     status_message_id: int | None,
 ) -> str:
     queue = _get_queue()
@@ -131,7 +133,6 @@ def enqueue_audio_generation(
         generate_audio_task,
         task_id,
         chat_id,
-        transaction_id,
         status_message_id,
     )
     return job.id
@@ -184,6 +185,113 @@ def _get_user_balance(user_id: int) -> int:
         return user.balance_rub if user else 0
 
 
+def _build_lyrics_filename(base: str | None) -> str:
+    safe_base = sanitize_filename(base or "lyrics", max_length=60)
+    return f"{safe_base}_lyrics.txt"
+
+
+async def _send_review_payload(
+    *,
+    bot: Bot,
+    chat_id: int,
+    task_id: int,
+    status_prefix: str,
+    lyrics: str | None,
+    tags: str | None,
+    price: int,
+    balance: int,
+    mode: str,
+    filename_hint: str | None,
+    reply_markup,
+) -> None:
+    if not isinstance(lyrics, str) or not lyrics.strip():
+        await bot.send_message(
+            chat_id=chat_id,
+            text="❌ Не удалось получить текст песни. Попробуй ещё раз.",
+        )
+        logger.warning(
+            "Пустой текст песни при отправке ревью",
+            extra={"task_id": task_id, "chat_id": chat_id},
+        )
+        return
+    clean_lyrics = lyrics.strip()
+    logger.info(
+        "Отправка текста песни",
+        extra={
+            "task_id": task_id,
+            "chat_id": chat_id,
+            "lyrics_len": len(clean_lyrics),
+            "lyrics_preview": clean_lyrics[:80],
+        },
+    )
+    label = "Описание инструментала" if mode == "instrumental" else "Текст песни"
+    body = f"{label}:\n\n{clean_lyrics}"
+    tags_text = tags or ""
+    review_suffix = f"\n\nТеги: {tags_text}\nЦена аудио: {price} ₽ | Баланс: {balance} ₽"
+    if len(body) > LYRICS_MESSAGE_LIMIT or len(clean_lyrics) > LYRICS_MESSAGE_LIMIT:
+        tmp_dir = Path(settings.storage_dir) / "tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        filename = _build_lyrics_filename(filename_hint or "lyrics")
+        file_path = tmp_dir / filename
+        file_path.write_text(clean_lyrics, encoding="utf-8")
+        try:
+            sent_doc = await bot.send_document(
+                chat_id=chat_id,
+                document=FSInputFile(file_path),
+                caption=f"{status_prefix}\n{label} отправлен файлом.",
+            )
+            logger.info(
+                "Текст песни отправлен файлом",
+                extra={"task_id": task_id, "chat_id": chat_id, "message_id": sent_doc.message_id},
+            )
+        except Exception:
+            logger.exception(
+                "Ошибка отправки текста песни файлом",
+                extra={"task_id": task_id, "chat_id": chat_id},
+            )
+            await bot.send_message(
+                chat_id=chat_id,
+                text="❌ Не удалось отправить текст песни. Попробуй ещё раз.",
+            )
+            return
+        finally:
+            try:
+                file_path.unlink()
+            except OSError as exc:
+                logger.warning("Не удалось удалить файл %s: %s", file_path, exc)
+        try:
+            sent_message = await bot.send_message(
+                chat_id=chat_id,
+                text=f"{status_prefix}\n\nТеги: {tags_text}\nЦена аудио: {price} ₽ | Баланс: {balance} ₽",
+                reply_markup=reply_markup,
+            )
+            logger.info(
+                "Сообщение с тегами отправлено",
+                extra={"task_id": task_id, "chat_id": chat_id, "message_id": sent_message.message_id},
+            )
+        except Exception:
+            logger.exception(
+                "Ошибка отправки сообщения с тегами",
+                extra={"task_id": task_id, "chat_id": chat_id},
+            )
+        return
+    try:
+        sent_message = await bot.send_message(
+            chat_id=chat_id,
+            text=f"{status_prefix}\n\n{body}{review_suffix}",
+            reply_markup=reply_markup,
+        )
+        logger.info(
+            "Сообщение с ревью текста отправлено",
+            extra={"task_id": task_id, "chat_id": chat_id, "message_id": sent_message.message_id},
+        )
+    except Exception:
+        logger.exception(
+            "Ошибка отправки сообщения с ревью",
+            extra={"task_id": task_id, "chat_id": chat_id},
+        )
+
+
 def generate_text_task(task_id: int) -> None:
     task, preset = _load_task_and_preset(task_id)
     if not task or not preset:
@@ -199,6 +307,7 @@ def generate_text_task(task_id: int) -> None:
     )
     status_prefix = f"🎛 Пресет: {preset['title']}"
     mode = preset.get("mode", "song")
+    lyrics_for_review: str | None = None
     with SessionLocal() as session:
         update_task(session, task_id, status=TEXT_RUNNING)
     initial_status = "⏳ Генерирую текст…"
@@ -230,6 +339,7 @@ def generate_text_task(task_id: int) -> None:
                 )
                 _store_message_id(task_id, status_message_id)
             suggested_title, prompt = _parse_instrumental_result(instrumental_result.result)
+            lyrics_for_review = prompt
             with SessionLocal() as session:
                 update_task(
                     session,
@@ -265,6 +375,7 @@ def generate_text_task(task_id: int) -> None:
                 )
                 _store_message_id(task_id, status_message_id)
             lyrics = lyrics_result.result
+            lyrics_for_review = lyrics
             with SessionLocal() as session:
                 update_task(session, task_id, lyrics_current=lyrics, status=TAGS_RUNNING, genapi_request_id=None)
             status_message_id = _update_progress_message(
@@ -291,6 +402,7 @@ def generate_text_task(task_id: int) -> None:
                 )
                 _store_message_id(task_id, status_message_id)
             lyrics = lyrics_result.result
+            lyrics_for_review = lyrics
             with SessionLocal() as session:
                 update_task(session, task_id, lyrics_current=lyrics, status=TAGS_RUNNING, genapi_request_id=None)
             status_message_id = _update_progress_message(
@@ -336,25 +448,18 @@ def generate_text_task(task_id: int) -> None:
             try:
                 balance = _get_user_balance(task.user_id)
                 price = preset.get("price_audio_rub", 0)
-                if mode == "instrumental":
-                    body = f"Описание инструментала:\n\n{task.lyrics_current or ''}"
-                else:
-                    body = f"Текст песни:\n\n{task.lyrics_current or ''}"
-                await bot.send_message(
+                await _send_review_payload(
+                    bot=bot,
                     chat_id=task.progress_chat_id,
-                    text=(
-                        f"{status_prefix}\n\n{body}\n\nТеги: {tags}\n"
-                        f"Цена аудио: {price} ₽ | Баланс: {balance} ₽"
-                    ),
+                    task_id=task_id,
+                    status_prefix=status_prefix,
+                    lyrics=lyrics_for_review,
+                    tags=tags,
+                    price=price,
+                    balance=balance,
+                    mode=mode,
+                    filename_hint=preset.get("title"),
                     reply_markup=review_keyboard(),
-                )
-                logger.info(
-                    "Сообщение с ревью текста отправлено",
-                    extra={
-                        "task_id": task_id,
-                        "chat_id": task.progress_chat_id,
-                        "user_id": task.user_id,
-                    },
                 )
             finally:
                 await bot.session.close()
@@ -483,25 +588,18 @@ def generate_edit_task(task_id: int) -> None:
             try:
                 balance = _get_user_balance(task.user_id)
                 price = preset.get("price_audio_rub", 0)
-                if mode == "instrumental":
-                    body = f"Описание инструментала:\n\n{new_lyrics}"
-                else:
-                    body = f"Текст песни:\n\n{new_lyrics}"
-                await bot.send_message(
+                await _send_review_payload(
+                    bot=bot,
                     chat_id=task.progress_chat_id,
-                    text=(
-                        f"{status_prefix}\n\n{body}\n\nТеги: {tags}\n"
-                        f"Цена аудио: {price} ₽ | Баланс: {balance} ₽"
-                    ),
+                    task_id=task_id,
+                    status_prefix=status_prefix,
+                    lyrics=new_lyrics,
+                    tags=tags,
+                    price=price,
+                    balance=balance,
+                    mode=mode,
+                    filename_hint=preset.get("title"),
                     reply_markup=review_keyboard(),
-                )
-                logger.info(
-                    "Сообщение с ревью правок отправлено",
-                    extra={
-                        "task_id": task_id,
-                        "chat_id": task.progress_chat_id,
-                        "user_id": task.user_id,
-                    },
                 )
             finally:
                 await bot.session.close()
@@ -524,7 +622,6 @@ def generate_edit_task(task_id: int) -> None:
 def generate_audio_task(
     task_id: int,
     chat_id: int,
-    transaction_id: int,
     status_message_id: int | None,
 ) -> None:
     task, preset = _load_task_and_preset(task_id)
@@ -537,7 +634,6 @@ def generate_audio_task(
             "chat_id": chat_id,
             "message_id": status_message_id,
             "user_id": task.user_id,
-            "transaction_id": transaction_id,
         },
     )
     status_text_prefix = f"🎛 Пресет: {preset['title']}"
@@ -590,14 +686,17 @@ def generate_audio_task(
                 mp3_url_2=mp3_url_2,
                 suno_request_id=None,
             )
-            capture_audio(session, transaction_id)
     except GenApiError as exc:
         logger.error(
             "Ошибка Suno",
             extra={"task_id": task_id, "chat_id": chat_id, "user_id": task.user_id},
         )
         with SessionLocal() as session:
-            release_audio(session, transaction_id)
+            price = preset.get("price_audio_rub", 0)
+            if price:
+                user = session.get(User, task.user_id)
+                if user:
+                    adjust_balance(session, user.tg_id, price, "refund_audio", task_id=task_id)
             update_task(session, task_id, status=FAILED, error_message=str(exc))
         async def _notify_failure() -> None:
             bot = Bot(token=settings.bot_token)

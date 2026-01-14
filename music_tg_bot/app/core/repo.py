@@ -32,39 +32,34 @@ def get_balance(session: Session, tg_id: int) -> int:
     return user.balance_rub
 
 
-def add_balance(session: Session, tg_id: int, amount: int) -> int:
-    user = get_or_create_user_by_tg_id(session, tg_id)
-    user.balance_rub += amount
-    session.add_all(
-        [
-            user,
-            Transaction(
-                user_id=user.id,
-                amount_rub=amount,
-                type="admin_add",
-                status="capture",
-            ),
-        ]
+def adjust_balance(
+    session: Session,
+    tg_id: int,
+    delta: int,
+    type: str,
+    task_id: int | None = None,
+    external_id: str | None = None,
+) -> int:
+    user = session.scalar(select(User).where(User.tg_id == tg_id).with_for_update())
+    if not user:
+        user = User(tg_id=tg_id)
+        session.add(user)
+        session.flush()
+    if delta == 0:
+        return user.balance_rub
+    new_balance = user.balance_rub + delta
+    if delta < 0 and new_balance < 0:
+        session.rollback()
+        raise ValueError("Недостаточно средств")
+    user.balance_rub = new_balance
+    transaction = Transaction(
+        user_id=user.id,
+        amount_rub=delta,
+        type=type,
+        status="capture",
+        external_id=external_id,
     )
-    session.commit()
-    session.refresh(user)
-    return user.balance_rub
-
-
-def set_balance(session: Session, tg_id: int, amount: int) -> int:
-    user = get_or_create_user_by_tg_id(session, tg_id)
-    user.balance_rub = amount
-    session.add_all(
-        [
-            user,
-            Transaction(
-                user_id=user.id,
-                amount_rub=amount,
-                type="admin_set",
-                status="capture",
-            ),
-        ]
-    )
+    session.add_all([user, transaction])
     session.commit()
     session.refresh(user)
     return user.balance_rub
@@ -88,86 +83,22 @@ def consume_free_quota(session: Session, user: User) -> bool:
 
 
 def charge_text(session: Session, user: User) -> bool:
-    if user.balance_rub < TEXT_PRICE_RUB:
+    try:
+        adjust_balance(session, user.tg_id, -TEXT_PRICE_RUB, "spend_text")
+    except ValueError:
         return False
-    user.balance_rub -= TEXT_PRICE_RUB
-    session.add(user)
-    session.add(
-        Transaction(
-            user_id=user.id,
-            amount_rub=TEXT_PRICE_RUB,
-            type="text",
-            status="capture",
-        )
-    )
-    session.commit()
     return True
 
 
-def hold_audio(session: Session, user: User, amount_rub: int) -> Transaction | None:
-    if user.balance_rub < amount_rub:
-        return None
-    user.balance_rub -= amount_rub
-    transaction = Transaction(
-        user_id=user.id,
-        amount_rub=amount_rub,
-        type="audio",
-        status="hold",
-    )
-    session.add_all([user, transaction])
-    session.commit()
-    session.refresh(transaction)
-    return transaction
-
-
-def capture_audio(session: Session, transaction_id: int) -> None:
-    transaction = session.get(Transaction, transaction_id)
-    if not transaction:
-        return
-    transaction.status = "capture"
-    session.add(transaction)
-    session.commit()
-
-
-def release_audio(session: Session, transaction_id: int) -> None:
-    transaction = session.get(Transaction, transaction_id)
-    if not transaction:
-        return
-    user = session.get(User, transaction.user_id)
-    if user:
-        user.balance_rub += transaction.amount_rub
-        session.add(user)
-    transaction.status = "release"
-    session.add(transaction)
-    session.commit()
-
-
 def add_topup(session: Session, user: User, amount_rub: int, external_id: str) -> None:
-    user.balance_rub += amount_rub
-    transaction = Transaction(
-        user_id=user.id,
-        amount_rub=amount_rub,
-        type="topup",
-        status="capture",
-        external_id=external_id,
-    )
-    session.add_all([user, transaction])
-    session.commit()
+    adjust_balance(session, user.tg_id, amount_rub, "topup", external_id=external_id)
 
 
 def apply_welcome_bonus(session: Session, user: User, amount_rub: int) -> bool:
     if user.welcome_bonus_given:
         return False
-    user.balance_rub += amount_rub
+    adjust_balance(session, user.tg_id, amount_rub, "welcome_bonus")
     user.welcome_bonus_given = True
-    session.add(
-        Transaction(
-            user_id=user.id,
-            amount_rub=amount_rub,
-            type="welcome_bonus",
-            status="capture",
-        )
-    )
     session.add(user)
     session.commit()
     return True

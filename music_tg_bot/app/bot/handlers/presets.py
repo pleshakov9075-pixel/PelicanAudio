@@ -6,6 +6,8 @@ from app.bot.keyboards.inline import (
     presets_info_keyboard,
     presets_info_list_keyboard,
 )
+from app.core.db import SessionLocal
+from app.core.repo import get_or_create_user
 from app.presets.loader import load_categories, get_presets_by_category, get_preset
 
 router = Router()
@@ -42,8 +44,11 @@ async def show_preset_info(call: CallbackQuery) -> None:
         return
     description = preset.get("description", "")
     price = preset.get("price_audio_rub", 0)
+    with SessionLocal() as session:
+        user = get_or_create_user(session, call.from_user.id)
+        balance = user.balance_rub
     await call.message.answer(
-        f"🎛 Пресет: {preset['title']}\n{description}\nЦена аудио: {price} ₽",
+        f"🎛 Пресет: {preset['title']}\n{description}\nЦена аудио: {price} ₽\nБаланс: {balance} ₽",
         reply_markup=presets_info_keyboard(preset_id),
     )
     await call.answer()

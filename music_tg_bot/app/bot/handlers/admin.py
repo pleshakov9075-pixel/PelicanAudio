@@ -5,7 +5,7 @@ from aiogram.types import Message
 
 from app.core.config import settings
 from app.core.db import SessionLocal
-from app.core.repo import add_balance, get_balance, set_balance
+from app.core.repo import adjust_balance, get_balance
 
 router = Router()
 
@@ -65,7 +65,7 @@ async def dev_add_balance(message: Message, command: CommandObject) -> None:
         await message.answer("Сумма должна быть положительной")
         return
     with SessionLocal() as session:
-        balance = add_balance(session, message.from_user.id, amount)
+        balance = adjust_balance(session, message.from_user.id, amount, "admin_add")
     await message.answer(f"💳 Баланс пополнен на {amount} ₽. Текущий баланс: {balance} ₽")
 
 
@@ -82,7 +82,12 @@ async def dev_set_balance(message: Message, command: CommandObject) -> None:
         await message.answer("Сумма должна быть положительной")
         return
     with SessionLocal() as session:
-        balance = set_balance(session, message.from_user.id, amount)
+        current_balance = get_balance(session, message.from_user.id)
+        delta = amount - current_balance
+        if delta == 0:
+            balance = current_balance
+        else:
+            balance = adjust_balance(session, message.from_user.id, delta, "admin_set")
     await message.answer(f"💳 Баланс установлен: {balance} ₽")
 
 
@@ -100,7 +105,7 @@ async def dev_give_balance(message: Message, command: CommandObject) -> None:
         await message.answer("Сумма должна быть положительной")
         return
     with SessionLocal() as session:
-        balance = add_balance(session, tg_id, amount)
+        balance = adjust_balance(session, tg_id, amount, "admin_add")
     await message.answer(
         f"✅ Начислено {amount} ₽ пользователю {tg_id}. Баланс теперь: {balance} ₽"
     )
