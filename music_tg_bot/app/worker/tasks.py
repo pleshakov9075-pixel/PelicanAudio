@@ -22,7 +22,14 @@ from app.core.generation import (
     build_user_lyrics_messages,
 )
 from app.core.models import User
-from app.core.repo import adjust_balance, create_track, get_task, update_task
+from app.core.repo import (
+    FREE_QUOTA_PER_DAY,
+    adjust_balance,
+    create_track,
+    get_free_quota_remaining,
+    get_task,
+    update_task,
+)
 from app.core.task_status import (
     AUDIO_POLLING,
     AUDIO_RUNNING,
@@ -177,12 +184,13 @@ def _load_task_and_preset(task_id: int) -> tuple[object | None, dict | None]:
     return task, preset
 
 
-def _get_user_balance(user_id: int) -> int:
-    from app.core.models import User
-
+def _get_user_balance_and_remaining(user_id: int) -> tuple[int, int]:
     with SessionLocal() as session:
         user = session.get(User, user_id)
-        return user.balance_rub if user else 0
+        if not user:
+            return 0, 0
+        remaining = get_free_quota_remaining(session, user)
+        return user.balance_rub, remaining
 
 
 def _build_lyrics_filename(base: str | None) -> str:
@@ -200,6 +208,7 @@ async def _send_review_payload(
     tags: str | None,
     price: int,
     balance: int,
+    remaining: int,
     mode: str,
     filename_hint: str | None,
     reply_markup,
@@ -227,7 +236,11 @@ async def _send_review_payload(
     label = "Описание инструментала" if mode == "instrumental" else "Текст песни"
     body = f"{label}:\n\n{clean_lyrics}"
     tags_text = tags or ""
-    review_suffix = f"\n\nТеги: {tags_text}\nЦена аудио: {price} ₽ | Баланс: {balance} ₽"
+    review_suffix = (
+        f"\n\nТеги: {tags_text}\n"
+        f"📝 Бесплатных текстов сегодня: {max(0, remaining)}/{FREE_QUOTA_PER_DAY}\n"
+        f"Цена аудио: {price} ₽ | Баланс: {balance} ₽"
+    )
     if len(body) > LYRICS_MESSAGE_LIMIT or len(clean_lyrics) > LYRICS_MESSAGE_LIMIT:
         tmp_dir = Path(settings.storage_dir) / "tmp"
         tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -262,7 +275,11 @@ async def _send_review_payload(
         try:
             sent_message = await bot.send_message(
                 chat_id=chat_id,
-                text=f"{status_prefix}\n\nТеги: {tags_text}\nЦена аудио: {price} ₽ | Баланс: {balance} ₽",
+                text=(
+                    f"{status_prefix}\n\nТеги: {tags_text}\n"
+                    f"📝 Бесплатных текстов сегодня: {max(0, remaining)}/{FREE_QUOTA_PER_DAY}\n"
+                    f"Цена аудио: {price} ₽ | Баланс: {balance} ₽"
+                ),
                 reply_markup=reply_markup,
             )
             logger.info(
@@ -446,7 +463,7 @@ def generate_text_task(task_id: int) -> None:
 
             bot = Bot(token=settings.bot_token)
             try:
-                balance = _get_user_balance(task.user_id)
+                balance, remaining = _get_user_balance_and_remaining(task.user_id)
                 price = preset.get("price_audio_rub", 0)
                 await _send_review_payload(
                     bot=bot,
@@ -457,6 +474,7 @@ def generate_text_task(task_id: int) -> None:
                     tags=tags,
                     price=price,
                     balance=balance,
+                    remaining=remaining,
                     mode=mode,
                     filename_hint=preset.get("title"),
                     reply_markup=review_keyboard(),
@@ -586,7 +604,7 @@ def generate_edit_task(task_id: int) -> None:
 
             bot = Bot(token=settings.bot_token)
             try:
-                balance = _get_user_balance(task.user_id)
+                balance, remaining = _get_user_balance_and_remaining(task.user_id)
                 price = preset.get("price_audio_rub", 0)
                 await _send_review_payload(
                     bot=bot,
@@ -597,6 +615,7 @@ def generate_edit_task(task_id: int) -> None:
                     tags=tags,
                     price=price,
                     balance=balance,
+                    remaining=remaining,
                     mode=mode,
                     filename_hint=preset.get("title"),
                     reply_markup=review_keyboard(),
@@ -696,7 +715,7 @@ def generate_audio_task(
             if price:
                 user = session.get(User, task.user_id)
                 if user:
-                    adjust_balance(session, user.tg_id, price, "refund_audio", task_id=task_id)
+                    adjust_balance(session, user.tg_id, price, "refund", task_id=task_id)
             update_task(session, task_id, status=FAILED, error_message=str(exc))
         async def _notify_failure() -> None:
             bot = Bot(token=settings.bot_token)

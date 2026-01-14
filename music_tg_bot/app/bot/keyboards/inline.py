@@ -49,11 +49,30 @@ def review_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def text_payment_keyboard() -> InlineKeyboardMarkup:
+def text_payment_keyboard(price_rub: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Сгенерировать текст за 19 ₽", callback_data="textpay:confirm")],
+            [InlineKeyboardButton(text=f"💳 Сгенерировать текст за {price_rub} ₽", callback_data="textpay:pay")],
             [InlineKeyboardButton(text="⏳ Подождать до завтра", callback_data="textpay:wait")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="textpay:cancel")],
+        ]
+    )
+
+
+def text_payment_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Подтвердить", callback_data="textpay:confirm")],
+            [InlineKeyboardButton(text="↩️ Назад", callback_data="textpay:back")],
+        ]
+    )
+
+
+def audio_payment_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Подтвердить", callback_data="audiopay:confirm")],
+            [InlineKeyboardButton(text="↩️ Назад", callback_data="audiopay:back")],
         ]
     )
 

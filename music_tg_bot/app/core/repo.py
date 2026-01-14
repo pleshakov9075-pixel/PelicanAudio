@@ -8,8 +8,12 @@ from sqlalchemy.orm import Session
 from app.core.models import User, Transaction, Track, Task
 
 
-FREE_QUOTA_PER_DAY = 3
-TEXT_PRICE_RUB = 19
+FREE_QUOTA_PER_DAY = 5
+TEXT_PRICE_RUB = 10
+
+
+class InsufficientFunds(ValueError):
+    pass
 
 
 def get_or_create_user(session: Session, tg_id: int) -> User:
@@ -36,7 +40,7 @@ def adjust_balance(
     session: Session,
     tg_id: int,
     delta: int,
-    type: str,
+    tx_type: str,
     task_id: int | None = None,
     external_id: str | None = None,
 ) -> int:
@@ -50,14 +54,15 @@ def adjust_balance(
     new_balance = user.balance_rub + delta
     if delta < 0 and new_balance < 0:
         session.rollback()
-        raise ValueError("Недостаточно средств")
+        raise InsufficientFunds("Недостаточно средств")
     user.balance_rub = new_balance
     transaction = Transaction(
         user_id=user.id,
         amount_rub=delta,
-        type=type,
+        type=tx_type,
         status="capture",
         external_id=external_id,
+        task_id=task_id,
     )
     session.add_all([user, transaction])
     session.commit()
@@ -65,15 +70,22 @@ def adjust_balance(
     return user.balance_rub
 
 
-def reset_quota_if_needed(user: User) -> None:
+def reset_quota_if_needed(session: Session, user: User) -> None:
     today = dt.date.today()
     if user.free_quota_date != today:
         user.free_quota_date = today
         user.free_quota_used = 0
+        session.add(user)
+        session.commit()
+
+
+def get_free_quota_remaining(session: Session, user: User) -> int:
+    reset_quota_if_needed(session, user)
+    return max(0, FREE_QUOTA_PER_DAY - user.free_quota_used)
 
 
 def consume_free_quota(session: Session, user: User) -> bool:
-    reset_quota_if_needed(user)
+    reset_quota_if_needed(session, user)
     if user.free_quota_used >= FREE_QUOTA_PER_DAY:
         return False
     user.free_quota_used += 1
@@ -85,7 +97,7 @@ def consume_free_quota(session: Session, user: User) -> bool:
 def charge_text(session: Session, user: User) -> bool:
     try:
         adjust_balance(session, user.tg_id, -TEXT_PRICE_RUB, "spend_text")
-    except ValueError:
+    except InsufficientFunds:
         return False
     return True
 

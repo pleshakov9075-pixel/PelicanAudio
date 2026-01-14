@@ -8,3 +8,4 @@ class TrackStates(StatesGroup):
     waiting_for_review = State()
     waiting_for_edit = State()
     waiting_for_title = State()
+    waiting_for_audio_confirm = State()

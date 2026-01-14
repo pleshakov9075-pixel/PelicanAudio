@@ -31,6 +31,7 @@ class Transaction(Base):
     type: Mapped[str] = mapped_column(String(32))
     status: Mapped[str] = mapped_column(String(32))
     external_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    task_id: Mapped[int | None] = mapped_column(ForeignKey("tasks.id"), nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
 
     user: Mapped[User] = relationship("User", back_populates="transactions")

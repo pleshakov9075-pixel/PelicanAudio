@@ -10,17 +10,22 @@ from app.bot.keyboards.inline import (
     categories_keyboard,
     presets_keyboard,
     text_payment_keyboard,
+    text_payment_confirm_keyboard,
     title_keyboard,
+    audio_payment_confirm_keyboard,
 )
 from app.bot.keyboards.reply import main_menu
 from app.bot.fsm.states import TrackStates
 from app.core.db import SessionLocal
 from app.core.repo import (
     adjust_balance,
-    get_or_create_user,
     get_balance,
+    get_free_quota_remaining,
+    get_or_create_user,
     consume_free_quota,
-    charge_text,
+    InsufficientFunds,
+    FREE_QUOTA_PER_DAY,
+    TEXT_PRICE_RUB,
     create_task,
     get_task,
     update_task,
@@ -105,14 +110,21 @@ async def _send_or_edit_progress(message: Message, task_id: int, text: str) -> i
     return new_message.message_id
 
 
-def _consume_text_quota(user_id: int, paid_allowed: bool = False) -> tuple[bool, str]:
-    with SessionLocal() as session:
-        user = get_or_create_user(session, user_id)
-        if consume_free_quota(session, user):
-            return True, "free"
-        if paid_allowed and charge_text(session, user):
-            return True, "paid"
-    return False, "denied"
+def _free_text_remaining_line(remaining: int) -> str:
+    safe_remaining = max(0, remaining)
+    return f"📝 Бесплатных текстов сегодня: {safe_remaining}/{FREE_QUOTA_PER_DAY}"
+
+
+def _paid_text_offer_message(balance: int) -> str:
+    return (
+        f"Лимит бесплатных текстов исчерпан ({FREE_QUOTA_PER_DAY}/{FREE_QUOTA_PER_DAY}).\n"
+        f"Стоимость генерации текста: {TEXT_PRICE_RUB} ₽.\n"
+        f"Баланс: {balance} ₽"
+    )
+
+
+def _paid_text_confirm_message(balance: int) -> str:
+    return f"Цена: {TEXT_PRICE_RUB} ₽ | Баланс: {balance} ₽"
 
 
 @router.message(lambda message: message.text == "🎵 Создать трек")
@@ -175,17 +187,19 @@ async def handle_brief(message: Message, state: FSMContext) -> None:
         await state.clear()
         return
 
-    allowed, mode = _consume_text_quota(message.from_user.id, paid_allowed=False)
-    if not allowed:
-        await message.answer(
-            _with_preset(
-                preset,
-                "Лимит бесплатных генераций исчерпан. Хотите сгенерировать текст за 19 ₽?",
-            ),
-            reply_markup=text_payment_keyboard(),
-        )
-        await state.update_data(brief=message.text)
-        return
+    with SessionLocal() as session:
+        user = get_or_create_user(session, message.from_user.id)
+        remaining = get_free_quota_remaining(session, user)
+        balance = user.balance_rub
+        if remaining <= 0:
+            await message.answer(
+                _with_preset(preset, _paid_text_offer_message(balance)),
+                reply_markup=text_payment_keyboard(TEXT_PRICE_RUB),
+            )
+            await state.update_data(brief=message.text, pending_text_action="generate")
+            return
+        consume_free_quota(session, user)
+    await message.answer(_with_preset(preset, _free_text_remaining_line(remaining)))
 
     await state.update_data(brief=message.text)
     await _queue_text_generation(message, state, preset, message.text)
@@ -212,37 +226,88 @@ async def handle_user_lyrics_text(message: Message, state: FSMContext) -> None:
         await message.answer("Пресет не найден. Начните заново.")
         await state.clear()
         return
-    allowed, mode = _consume_text_quota(message.from_user.id, paid_allowed=False)
-    if not allowed:
-        await message.answer(
-            _with_preset(
-                preset,
-                "Лимит бесплатных генераций исчерпан. Хотите оформить текст за 19 ₽?",
-            ),
-            reply_markup=text_payment_keyboard(),
-        )
-        await state.update_data(user_lyrics_raw=message.text)
-        return
+    with SessionLocal() as session:
+        user = get_or_create_user(session, message.from_user.id)
+        remaining = get_free_quota_remaining(session, user)
+        balance = user.balance_rub
+        if remaining <= 0:
+            await message.answer(
+                _with_preset(preset, _paid_text_offer_message(balance)),
+                reply_markup=text_payment_keyboard(TEXT_PRICE_RUB),
+            )
+            await state.update_data(user_lyrics_raw=message.text, pending_text_action="user_lyrics")
+            return
+        consume_free_quota(session, user)
+    await message.answer(_with_preset(preset, _free_text_remaining_line(remaining)))
     await state.update_data(user_lyrics_raw=message.text)
     await _queue_text_generation(message, state, preset, data.get("brief", ""), user_lyrics_raw=message.text)
+
+
+@router.callback_query(lambda call: call.data == "textpay:pay")
+async def paid_text_start(call: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    preset = get_preset(data.get("preset_id", ""))
+    if not preset:
+        await call.message.answer("Пресет не найден. Начните заново.")
+        await call.answer()
+        return
+    with SessionLocal() as session:
+        balance = get_balance(session, call.from_user.id)
+    await call.message.answer(
+        _with_preset(preset, _paid_text_confirm_message(balance)),
+        reply_markup=text_payment_confirm_keyboard(),
+    )
+    await call.answer()
+
+
+@router.callback_query(lambda call: call.data == "textpay:back")
+async def paid_text_back(call: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    preset = get_preset(data.get("preset_id", ""))
+    if not preset:
+        await call.message.answer("Пресет не найден. Начните заново.")
+        await call.answer()
+        return
+    with SessionLocal() as session:
+        balance = get_balance(session, call.from_user.id)
+    await call.message.answer(
+        _with_preset(preset, _paid_text_offer_message(balance)),
+        reply_markup=text_payment_keyboard(TEXT_PRICE_RUB),
+    )
+    await call.answer()
 
 
 @router.callback_query(lambda call: call.data == "textpay:confirm")
 async def paid_text_confirm(call: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
-    brief = data.get("brief")
     preset = get_preset(data.get("preset_id", ""))
+    pending_action = data.get("pending_text_action")
+    brief = data.get("brief")
     user_lyrics_raw = data.get("user_lyrics_raw")
-    if not brief or not preset:
+    if not preset or not pending_action:
         await call.message.answer("Данные не найдены. Начните заново.")
         await call.answer()
         return
-    allowed, mode = _consume_text_quota(call.from_user.id, paid_allowed=True)
-    if not allowed:
-        await call.message.answer(_with_preset(preset, "Недостаточно средств на балансе."))
-        await call.answer()
-        return
-    await _queue_text_generation(call.message, state, preset, brief, user_lyrics_raw=user_lyrics_raw)
+    with SessionLocal() as session:
+        try:
+            adjust_balance(session, call.from_user.id, -TEXT_PRICE_RUB, "spend_text")
+        except InsufficientFunds:
+            current_balance = get_balance(session, call.from_user.id)
+            await call.message.answer(
+                _with_preset(preset, f"Недостаточно средств. Баланс: {current_balance} ₽.")
+            )
+            await call.answer()
+            return
+    await state.update_data(pending_text_action=None)
+    if pending_action == "regen":
+        await state.update_data(used_new_variant=True)
+        await _queue_regeneration(call.message, state, preset, data.get("brief", ""))
+    else:
+        if not brief:
+            await call.message.answer("Данные не найдены. Начните заново.")
+            await call.answer()
+            return
+        await _queue_text_generation(call.message, state, preset, brief, user_lyrics_raw=user_lyrics_raw)
     await call.answer()
 
 
@@ -252,6 +317,16 @@ async def paid_text_wait(call: CallbackQuery, state: FSMContext) -> None:
     preset = get_preset(data.get("preset_id", "")) if data else None
     text = "Хорошо, возвращайтесь завтра за бесплатными генерациями."
     await call.message.answer(_with_preset(preset, text) if preset else text)
+    await state.clear()
+    await call.answer()
+
+
+@router.callback_query(lambda call: call.data == "textpay:cancel")
+async def paid_text_cancel(call: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    preset = get_preset(data.get("preset_id", "")) if data else None
+    text = "Отмена. Выберите действие в меню."
+    await call.message.answer(_with_preset(preset, text) if preset else text, reply_markup=main_menu())
     await state.clear()
     await call.answer()
 
@@ -351,11 +426,20 @@ async def review_actions(call: CallbackQuery, state: FSMContext) -> None:
             await call.message.answer(_with_preset(preset, "Новый вариант уже был использован."))
             await call.answer()
             return
-        allowed, mode = _consume_text_quota(call.from_user.id, paid_allowed=True)
-        if not allowed:
-            await call.message.answer(_with_preset(preset, "Недостаточно средств для нового варианта."))
-            await call.answer()
-            return
+        with SessionLocal() as session:
+            user = get_or_create_user(session, call.from_user.id)
+            remaining = get_free_quota_remaining(session, user)
+            balance = user.balance_rub
+            if remaining <= 0:
+                await call.message.answer(
+                    _with_preset(preset, _paid_text_offer_message(balance)),
+                    reply_markup=text_payment_keyboard(TEXT_PRICE_RUB),
+                )
+                await state.update_data(pending_text_action="regen")
+                await call.answer()
+                return
+            consume_free_quota(session, user)
+        await call.message.answer(_with_preset(preset, _free_text_remaining_line(remaining)))
         brief = data.get("brief", "")
         await state.update_data(used_new_variant=True)
         await _queue_regeneration(call.message, state, preset, brief)
@@ -398,10 +482,14 @@ async def handle_edit(message: Message, state: FSMContext) -> None:
         else:
             body = f"Текст песни:\n\n{lyrics}"
         price = preset.get("price_audio_rub", 0)
+        with SessionLocal() as session:
+            user = get_or_create_user(session, message.from_user.id)
+            remaining = get_free_quota_remaining(session, user)
         await message.answer(
             text=(
                 "Ок, оставляем как есть ✅\n\n"
                 f"{status_prefix}\n\n{body}\n\nТеги: {tags}\n"
+                f"{_free_text_remaining_line(remaining)}\n"
                 f"Цена аудио: {price} ₽ | Баланс: {balance} ₽"
             ),
             reply_markup=review_keyboard(),
@@ -479,23 +567,40 @@ async def _finalize_track(message: Message, state: FSMContext, preset: dict, tit
     amount = preset["price_audio_rub"]
     with SessionLocal() as session:
         balance = get_balance(session, message.from_user.id)
-        try:
-            adjust_balance(session, message.from_user.id, -amount, "spend_audio", task_id=task_id)
-            charged = True
-        except ValueError:
-            charged = False
-    if not charged:
-        with SessionLocal() as session:
-            update_task(session, task_id, status=PAYMENT_WAITING)
-        await message.answer(
-            _with_preset(
-                preset,
-                f"Недостаточно средств для аудио. Цена: {amount} ₽, баланс: {balance} ₽.",
-            )
-        )
-        await state.clear()
+    await state.update_data(pending_audio_amount=amount)
+    await state.set_state(TrackStates.waiting_for_audio_confirm)
+    await message.answer(
+        _with_preset(preset, f"Списать {amount} ₽ за аудио? Баланс: {balance} ₽"),
+        reply_markup=audio_payment_confirm_keyboard(),
+    )
+
+
+@router.callback_query(lambda call: call.data == "audiopay:confirm")
+async def audio_payment_confirm(call: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    preset = get_preset(data.get("preset_id", ""))
+    task_id = data.get("task_id")
+    amount = data.get("pending_audio_amount")
+    if not preset or not task_id or amount is None:
+        await call.message.answer("Данные не найдены. Начните заново.")
+        await call.answer()
         return
-    status_message = await message.answer(
+    with SessionLocal() as session:
+        try:
+            adjust_balance(session, call.from_user.id, -amount, "spend_audio", task_id=task_id)
+        except InsufficientFunds:
+            current_balance = get_balance(session, call.from_user.id)
+            update_task(session, task_id, status=PAYMENT_WAITING)
+            await call.message.answer(
+                _with_preset(
+                    preset,
+                    f"Недостаточно средств для аудио. Цена: {amount} ₽, баланс: {current_balance} ₽.",
+                )
+            )
+            await state.clear()
+            await call.answer()
+            return
+    status_message = await call.message.answer(
         _with_preset(preset, "⏳ Генерирую аудио…"),
         reply_markup=main_menu(),
     )
@@ -504,7 +609,7 @@ async def _finalize_track(message: Message, state: FSMContext, preset: dict, tit
 
     job_id = enqueue_audio_generation(
         task_id=task_id,
-        chat_id=message.chat.id,
+        chat_id=call.message.chat.id,
         status_message_id=status_message.message_id,
     )
     with SessionLocal() as session:
@@ -512,10 +617,27 @@ async def _finalize_track(message: Message, state: FSMContext, preset: dict, tit
             session,
             task_id,
             status=AUDIO_QUEUED,
-            progress_chat_id=message.chat.id,
+            progress_chat_id=call.message.chat.id,
             progress_message_id=status_message.message_id,
         )
     logger.info("Трек поставлен в очередь: %s", job_id)
+    await call.answer()
+
+
+@router.callback_query(lambda call: call.data == "audiopay:back")
+async def audio_payment_back(call: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    preset = get_preset(data.get("preset_id", ""))
+    if not preset:
+        await call.message.answer("Пресет не найден. Начните заново.")
+        await call.answer()
+        return
+    await state.set_state(TrackStates.waiting_for_title)
+    await call.message.answer(
+        f"{_preset_line(preset)}\n\n🎼 Введите название трека или нажмите 🎲 Автоназвание",
+        reply_markup=title_keyboard(),
+    )
+    await call.answer()
 
 
 @router.callback_query(lambda call: call.data.startswith("track:second:"))
