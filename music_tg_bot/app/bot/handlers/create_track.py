@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 
 from aiogram import Router, F
+from aiogram.enums import ChatAction
 from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 
@@ -46,6 +47,32 @@ def _build_grok_messages(system_text: str, user_text: str) -> list[dict]:
 
 def _render_template(template: str, **kwargs: str) -> str:
     return template.format(**kwargs)
+
+
+def _preset_line(preset: dict) -> str:
+    return f"🎛 Пресет: {preset['title']}"
+
+
+def _with_preset(preset: dict, text: str) -> str:
+    return f"{_preset_line(preset)}\n{text}"
+
+
+async def _send_or_edit_status(message: Message, state: FSMContext, text: str) -> int:
+    data = await state.get_data()
+    status_message_id = data.get("status_message_id")
+    if status_message_id:
+        try:
+            await message.bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=status_message_id,
+                text=text,
+            )
+            return status_message_id
+        except Exception as exc:
+            logger.warning("Не удалось обновить статусное сообщение: %s", exc)
+    new_message = await message.answer(text)
+    await state.update_data(status_message_id=new_message.message_id)
+    return new_message.message_id
 
 
 async def _generate_lyrics(preset: dict, brief: str) -> str:
@@ -116,7 +143,7 @@ async def preset_selected(call: CallbackQuery, state: FSMContext) -> None:
     await state.update_data(preset_id=preset_id, used_new_variant=False)
     await state.set_state(TrackStates.waiting_for_brief)
     await call.message.answer(
-        "Отправьте одним сообщением вводные для песни (brief).",
+        f"{_preset_line(preset)}\n\nОтправьте одним сообщением вводные для песни (brief).",
         reply_markup=main_menu(),
     )
     await call.answer()
@@ -134,7 +161,10 @@ async def handle_brief(message: Message, state: FSMContext) -> None:
     allowed, mode = _consume_text_quota(message.from_user.id, paid_allowed=False)
     if not allowed:
         await message.answer(
-            "Лимит бесплатных генераций исчерпан. Хотите сгенерировать текст за 19 ₽?",
+            _with_preset(
+                preset,
+                "Лимит бесплатных генераций исчерпан. Хотите сгенерировать текст за 19 ₽?",
+            ),
             reply_markup=text_payment_keyboard(),
         )
         await state.update_data(brief=message.text)
@@ -155,7 +185,7 @@ async def paid_text_confirm(call: CallbackQuery, state: FSMContext) -> None:
         return
     allowed, mode = _consume_text_quota(call.from_user.id, paid_allowed=True)
     if not allowed:
-        await call.message.answer("Недостаточно средств на балансе.")
+        await call.message.answer(_with_preset(preset, "Недостаточно средств на балансе."))
         await call.answer()
         return
     await _generate_and_review(call.message, state, preset, brief)
@@ -164,22 +194,37 @@ async def paid_text_confirm(call: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(lambda call: call.data == "textpay:wait")
 async def paid_text_wait(call: CallbackQuery, state: FSMContext) -> None:
-    await call.message.answer("Хорошо, возвращайтесь завтра за бесплатными генерациями.")
+    data = await state.get_data()
+    preset = get_preset(data.get("preset_id", "")) if data else None
+    text = "Хорошо, возвращайтесь завтра за бесплатными генерациями."
+    await call.message.answer(_with_preset(preset, text) if preset else text)
     await state.clear()
     await call.answer()
 
 
 async def _generate_and_review(message: Message, state: FSMContext, preset: dict, brief: str) -> None:
+    await _send_or_edit_status(
+        message,
+        state,
+        _with_preset(preset, "⏳ Генерирую текст (≈15 сек)…"),
+    )
+    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     try:
         lyrics = await _generate_lyrics(preset, brief)
         tags = await _generate_tags(preset, lyrics)
     except GenApiError as exc:
-        await message.answer(f"Ошибка генерации: {exc}")
+        logger.error("Ошибка генерации текста: %s", exc)
+        await message.answer(_with_preset(preset, str(exc)))
         return
+    await _send_or_edit_status(
+        message,
+        state,
+        _with_preset(preset, "✅ Текст готов. Можно править или утвердить."),
+    )
     await state.update_data(lyrics=lyrics, tags=tags)
     await state.set_state(TrackStates.waiting_for_review)
     await message.answer(
-        f"Текст песни:\n\n{lyrics}\n\nТеги: {tags}",
+        f"{_preset_line(preset)}\n\nТекст песни:\n\n{lyrics}\n\nТеги: {tags}",
         reply_markup=review_keyboard(),
     )
 
@@ -198,20 +243,20 @@ async def review_actions(call: CallbackQuery, state: FSMContext) -> None:
     if action == "approve":
         await state.set_state(TrackStates.waiting_for_title)
         await call.message.answer(
-            "🎼 Введи название трека (1–40 символов) или нажми 🎲 Автоназвание",
+            f"{_preset_line(preset)}\n\n🎼 Введите название трека или нажмите 🎲 Автоназвание",
             reply_markup=title_keyboard(),
         )
     elif action == "edit":
         await state.set_state(TrackStates.waiting_for_edit)
-        await call.message.answer("Напиши, что поправить в тексте.")
+        await call.message.answer(f"{_preset_line(preset)}\n\nНапишите, что поправить в тексте.")
     elif action == "regen":
         if data.get("used_new_variant"):
-            await call.message.answer("Новый вариант уже был использован.")
+            await call.message.answer(_with_preset(preset, "Новый вариант уже был использован."))
             await call.answer()
             return
         allowed, mode = _consume_text_quota(call.from_user.id, paid_allowed=True)
         if not allowed:
-            await call.message.answer("Недостаточно средств для нового варианта.")
+            await call.message.answer(_with_preset(preset, "Недостаточно средств для нового варианта."))
             await call.answer()
             return
         brief = data.get("brief", "")
@@ -232,16 +277,24 @@ async def handle_edit(message: Message, state: FSMContext) -> None:
         await message.answer("Данные не найдены. Начните заново.")
         await state.clear()
         return
+    await _send_or_edit_status(message, state, _with_preset(preset, "⏳ Вношу правки (≈15 сек)…"))
+    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     try:
         new_lyrics = await _generate_edit(lyrics, message.text)
         tags = await _generate_tags(preset, new_lyrics)
     except GenApiError as exc:
-        await message.answer(f"Ошибка генерации: {exc}")
+        logger.error("Ошибка правок текста: %s", exc)
+        await message.answer(_with_preset(preset, str(exc)))
         return
+    await _send_or_edit_status(
+        message,
+        state,
+        _with_preset(preset, "✅ Текст готов. Можно править или утвердить."),
+    )
     await state.update_data(lyrics=new_lyrics, tags=tags)
     await state.set_state(TrackStates.waiting_for_review)
     await message.answer(
-        f"Обновлённый текст:\n\n{new_lyrics}\n\nТеги: {tags}",
+        f"{_preset_line(preset)}\n\nОбновлённый текст:\n\n{new_lyrics}\n\nТеги: {tags}",
         reply_markup=review_keyboard(),
     )
 
@@ -290,9 +343,13 @@ async def _finalize_track(message: Message, state: FSMContext, preset: dict, tit
         user = get_or_create_user(session, message.from_user.id)
         transaction = hold_audio(session, user, amount)
     if not transaction:
-        await message.answer("Недостаточно средств для аудио. Пополните баланс.")
+        await message.answer(_with_preset(preset, "Недостаточно средств для аудио. Пополните баланс."))
         await state.clear()
         return
+    status_message = await message.answer(
+        _with_preset(preset, "⏳ Генерирую аудио (≈3 минуты)…"),
+        reply_markup=main_menu(),
+    )
     await state.clear()
     from app.worker.tasks import enqueue_audio_generation
 
@@ -300,15 +357,14 @@ async def _finalize_track(message: Message, state: FSMContext, preset: dict, tit
         user_id=user.id,
         chat_id=message.chat.id,
         preset_id=preset["id"],
+        preset_title=preset["title"],
         title=title,
         lyrics=lyrics,
         tags=tags,
         transaction_id=transaction.id,
+        status_message_id=status_message.message_id,
     )
-    await message.answer(
-        f"Трек принят в работу. Идентификатор задачи: {job_id}",
-        reply_markup=main_menu(),
-    )
+    logger.info("Трек поставлен в очередь: %s", job_id)
 
 
 @router.callback_query(lambda call: call.data.startswith("track:second:"))

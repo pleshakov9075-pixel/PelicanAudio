@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import httpx
@@ -20,6 +21,45 @@ def _headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {settings.genapi_api_key}"}
 
 
+def _timeout(connect: float, read: float) -> httpx.Timeout:
+    return httpx.Timeout(connect=connect, read=read, write=connect, pool=connect)
+
+
+def _post_with_retries(
+    url: str,
+    payload: dict[str, Any],
+    timeout: httpx.Timeout,
+    operation: str,
+) -> httpx.Response:
+    retries = max(settings.genapi_retries, 1)
+    backoff = max(settings.genapi_retry_backoff, 0)
+    last_exc: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            response = httpx.post(url, headers=_headers(), json=payload, timeout=timeout)
+            response.raise_for_status()
+            return response
+        except httpx.RequestError as exc:
+            last_exc = exc
+            if attempt < retries:
+                delay = backoff * (2 ** (attempt - 1))
+                logger.warning(
+                    "Сетевая ошибка GenAPI (%s), повтор через %s сек: %s",
+                    operation,
+                    delay,
+                    exc,
+                )
+                if delay:
+                    time.sleep(delay)
+                continue
+            logger.exception("Сетевая ошибка GenAPI (%s) после ретраев", operation)
+            raise GenApiError("⚠️ Не удалось связаться с GenAPI, попробуйте ещё раз") from exc
+        except httpx.HTTPStatusError as exc:
+            logger.error("HTTP ошибка GenAPI (%s): %s", operation, exc)
+            raise GenApiError(f"Ошибка GenAPI: {exc}") from exc
+    raise GenApiError("⚠️ Не удалось связаться с GenAPI, попробуйте ещё раз") from last_exc
+
+
 def call_grok(messages: list[dict[str, Any]]) -> str:
     payload = {
         "model": "grok-4-1-fast-reasoning",
@@ -34,11 +74,12 @@ def call_grok(messages: list[dict[str, Any]]) -> str:
         "is_sync": False,
     }
     url = f"{settings.genapi_base_url.rstrip('/')}/v1/chat/completions"
-    try:
-        response = httpx.post(url, headers=_headers(), json=payload, timeout=60)
-        response.raise_for_status()
-    except httpx.HTTPError as exc:
-        raise GenApiError(f"Ошибка GenAPI: {exc}") from exc
+    response = _post_with_retries(
+        url,
+        payload,
+        _timeout(settings.genapi_timeout_connect, settings.genapi_timeout_read_grok),
+        "grok",
+    )
     data = response.json()
     try:
         return data["choices"][0]["message"]["content"]
@@ -56,11 +97,12 @@ def call_suno(title: str, tags: str, prompt: str) -> list[str]:
         "model": "v5",
     }
     url = f"{settings.genapi_base_url.rstrip('/')}/v1/suno"
-    try:
-        response = httpx.post(url, headers=_headers(), json=payload, timeout=120)
-        response.raise_for_status()
-    except httpx.HTTPError as exc:
-        raise GenApiError(f"Ошибка Suno: {exc}") from exc
+    response = _post_with_retries(
+        url,
+        payload,
+        _timeout(settings.genapi_timeout_connect, settings.genapi_timeout_read_suno),
+        "suno",
+    )
     data = response.json()
     if not isinstance(data, list) or len(data) < 2:
         raise GenApiError("Неожиданный ответ Suno")
