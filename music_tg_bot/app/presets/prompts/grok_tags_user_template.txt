@@ -1,11 +1,13 @@
 Пресет: {preset_title}
 Описание: {preset_description}
+Категория: {category_title}
 Настроение: {mood}
 Вайб: {vibe}
 Жанр: {genre}
 Короткая форма: {short_form}
+Режим: {mode}
 
-Текст песни:
-{lyrics}
+Контент (текст песни или описание):
+{content}
 
 Сгенерируй теги.

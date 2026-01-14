@@ -14,7 +14,13 @@ from rq import Queue
 
 from app.core.config import settings
 from app.core.db import SessionLocal
-from app.core.generation import build_edit_messages, build_lyrics_messages, build_tags_messages
+from app.core.generation import (
+    build_edit_messages,
+    build_instrumental_messages,
+    build_lyrics_messages,
+    build_tags_messages,
+    build_user_lyrics_messages,
+)
 from app.core.repo import capture_audio, release_audio, create_track, get_task, update_task
 from app.core.task_status import (
     AUDIO_POLLING,
@@ -30,11 +36,33 @@ from app.core.task_status import (
     TEXT_POLLING,
     TEXT_RUNNING,
 )
-from app.core.utils import sanitize_filename
+from app.core.utils import build_track_filename, sanitize_filename
 from app.integrations.genapi import call_grok, call_suno, GenApiError
 from app.presets.loader import get_preset
 
 logger = logging.getLogger("worker.tasks")
+
+
+def _parse_instrumental_result(result: str) -> tuple[str | None, str]:
+    title: str | None = None
+    prompt_lines: list[str] = []
+    for line in result.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        lower = stripped.lower()
+        if lower.startswith("title:"):
+            title = stripped.split(":", 1)[1].strip()
+            continue
+        if lower.startswith("prompt:"):
+            prompt_lines.append(stripped.split(":", 1)[1].strip())
+            continue
+        prompt_lines.append(stripped)
+    prompt = " ".join(prompt_lines).strip() or result.strip()
+    required_phrase = "инструментальная композиция, без вокала, без слов"
+    if required_phrase not in prompt.lower():
+        prompt = f"{prompt}. {required_phrase}"
+    return title, prompt
 
 
 async def _send_or_edit_status(
@@ -148,6 +176,14 @@ def _load_task_and_preset(task_id: int) -> tuple[object | None, dict | None]:
     return task, preset
 
 
+def _get_user_balance(user_id: int) -> int:
+    from app.core.models import User
+
+    with SessionLocal() as session:
+        user = session.get(User, user_id)
+        return user.balance_rub if user else 0
+
+
 def generate_text_task(task_id: int) -> None:
     task, preset = _load_task_and_preset(task_id)
     if not task or not preset:
@@ -162,40 +198,108 @@ def generate_text_task(task_id: int) -> None:
         },
     )
     status_prefix = f"🎛 Пресет: {preset['title']}"
+    mode = preset.get("mode", "song")
     with SessionLocal() as session:
         update_task(session, task_id, status=TEXT_RUNNING)
+    initial_status = "⏳ Генерирую текст…"
+    if mode == "instrumental":
+        initial_status = "⏳ Генерирую описание инструментала…"
+    elif mode == "user_lyrics":
+        initial_status = "⏳ Оформляю текст…"
     status_message_id = _update_progress_message(
         chat_id=task.progress_chat_id,
         message_id=task.progress_message_id,
-        text=f"{status_prefix}\n⏳ Генерирую текст…",
+        text=f"{status_prefix}\n{initial_status}",
     )
     _store_message_id(task_id, status_message_id)
     try:
-        lyrics_result = call_grok(build_lyrics_messages(preset, task.brief or ""))
-        if lyrics_result.request_id is not None:
+        if mode == "instrumental":
+            instrumental_result = call_grok(build_instrumental_messages(preset, task.brief or ""))
+            if instrumental_result.request_id is not None:
+                with SessionLocal() as session:
+                    update_task(
+                        session,
+                        task_id,
+                        status=TEXT_POLLING,
+                        genapi_request_id=instrumental_result.request_id,
+                    )
+                status_message_id = _update_progress_message(
+                    chat_id=task.progress_chat_id,
+                    message_id=status_message_id,
+                    text=f"{status_prefix}\n⏳ Генерирую описание инструментала… (polling)",
+                )
+                _store_message_id(task_id, status_message_id)
+            suggested_title, prompt = _parse_instrumental_result(instrumental_result.result)
             with SessionLocal() as session:
                 update_task(
                     session,
                     task_id,
-                    status=TEXT_POLLING,
-                    genapi_request_id=lyrics_result.request_id,
+                    lyrics_current=prompt,
+                    suggested_title=suggested_title,
+                    status=TAGS_RUNNING,
+                    genapi_request_id=None,
                 )
             status_message_id = _update_progress_message(
                 chat_id=task.progress_chat_id,
                 message_id=status_message_id,
-                text=f"{status_prefix}\n⏳ Генерирую текст… (polling)",
+                text=f"{status_prefix}\n✅ Описание готово. Генерирую теги…",
             )
             _store_message_id(task_id, status_message_id)
-        lyrics = lyrics_result.result
-        with SessionLocal() as session:
-            update_task(session, task_id, lyrics_current=lyrics, status=TAGS_RUNNING, genapi_request_id=None)
-        status_message_id = _update_progress_message(
-            chat_id=task.progress_chat_id,
-            message_id=status_message_id,
-            text=f"{status_prefix}\n✅ Текст готов. Генерирую теги…",
-        )
-        _store_message_id(task_id, status_message_id)
-        tags_result = call_grok(build_tags_messages(preset, lyrics))
+            tags_result = call_grok(build_tags_messages(preset, prompt, mode))
+        elif mode == "user_lyrics":
+            lyrics_result = call_grok(
+                build_user_lyrics_messages(preset, task.brief or "", task.user_lyrics_raw or "")
+            )
+            if lyrics_result.request_id is not None:
+                with SessionLocal() as session:
+                    update_task(
+                        session,
+                        task_id,
+                        status=TEXT_POLLING,
+                        genapi_request_id=lyrics_result.request_id,
+                    )
+                status_message_id = _update_progress_message(
+                    chat_id=task.progress_chat_id,
+                    message_id=status_message_id,
+                    text=f"{status_prefix}\n⏳ Оформляю текст… (polling)",
+                )
+                _store_message_id(task_id, status_message_id)
+            lyrics = lyrics_result.result
+            with SessionLocal() as session:
+                update_task(session, task_id, lyrics_current=lyrics, status=TAGS_RUNNING, genapi_request_id=None)
+            status_message_id = _update_progress_message(
+                chat_id=task.progress_chat_id,
+                message_id=status_message_id,
+                text=f"{status_prefix}\n✅ Текст оформлен. Генерирую теги…",
+            )
+            _store_message_id(task_id, status_message_id)
+            tags_result = call_grok(build_tags_messages(preset, lyrics, mode))
+        else:
+            lyrics_result = call_grok(build_lyrics_messages(preset, task.brief or ""))
+            if lyrics_result.request_id is not None:
+                with SessionLocal() as session:
+                    update_task(
+                        session,
+                        task_id,
+                        status=TEXT_POLLING,
+                        genapi_request_id=lyrics_result.request_id,
+                    )
+                status_message_id = _update_progress_message(
+                    chat_id=task.progress_chat_id,
+                    message_id=status_message_id,
+                    text=f"{status_prefix}\n⏳ Генерирую текст… (polling)",
+                )
+                _store_message_id(task_id, status_message_id)
+            lyrics = lyrics_result.result
+            with SessionLocal() as session:
+                update_task(session, task_id, lyrics_current=lyrics, status=TAGS_RUNNING, genapi_request_id=None)
+            status_message_id = _update_progress_message(
+                chat_id=task.progress_chat_id,
+                message_id=status_message_id,
+                text=f"{status_prefix}\n✅ Текст готов. Генерирую теги…",
+            )
+            _store_message_id(task_id, status_message_id)
+            tags_result = call_grok(build_tags_messages(preset, lyrics, mode))
         if tags_result.request_id is not None:
             with SessionLocal() as session:
                 update_task(
@@ -222,7 +326,7 @@ def generate_text_task(task_id: int) -> None:
         status_message_id = _update_progress_message(
             chat_id=task.progress_chat_id,
             message_id=status_message_id,
-            text=f"{status_prefix}\n✅ Готово. Проверь текст ниже:",
+            text=f"{status_prefix}\n✅ Готово. Проверь результат ниже:",
         )
         _store_message_id(task_id, status_message_id)
         async def _send_review() -> None:
@@ -230,9 +334,18 @@ def generate_text_task(task_id: int) -> None:
 
             bot = Bot(token=settings.bot_token)
             try:
+                balance = _get_user_balance(task.user_id)
+                price = preset.get("price_audio_rub", 0)
+                if mode == "instrumental":
+                    body = f"Описание инструментала:\n\n{task.lyrics_current or ''}"
+                else:
+                    body = f"Текст песни:\n\n{task.lyrics_current or ''}"
                 await bot.send_message(
                     chat_id=task.progress_chat_id,
-                    text=f"{status_prefix}\n\nТекст песни:\n\n{lyrics}\n\nТеги: {tags}",
+                    text=(
+                        f"{status_prefix}\n\n{body}\n\nТеги: {tags}\n"
+                        f"Цена аудио: {price} ₽ | Баланс: {balance} ₽"
+                    ),
                     reply_markup=review_keyboard(),
                 )
                 logger.info(
@@ -315,7 +428,7 @@ def generate_edit_task(task_id: int) -> None:
             text=f"{status_prefix}\n✅ Текст обновлён. Генерирую теги…",
         )
         _store_message_id(task_id, status_message_id)
-        tags_result = call_grok(build_tags_messages(preset, new_lyrics))
+        tags_result = call_grok(build_tags_messages(preset, new_lyrics, mode))
         if tags_result.request_id is not None:
             with SessionLocal() as session:
                 update_task(
@@ -342,7 +455,7 @@ def generate_edit_task(task_id: int) -> None:
         status_message_id = _update_progress_message(
             chat_id=task.progress_chat_id,
             message_id=status_message_id,
-            text=f"{status_prefix}\n✅ Готово. Проверь текст ниже:",
+            text=f"{status_prefix}\n✅ Готово. Проверь результат ниже:",
         )
         _store_message_id(task_id, status_message_id)
         async def _send_review() -> None:
@@ -350,9 +463,18 @@ def generate_edit_task(task_id: int) -> None:
 
             bot = Bot(token=settings.bot_token)
             try:
+                balance = _get_user_balance(task.user_id)
+                price = preset.get("price_audio_rub", 0)
+                if mode == "instrumental":
+                    body = f"Обновлённое описание инструментала:\n\n{new_lyrics}"
+                else:
+                    body = f"Обновлённый текст:\n\n{new_lyrics}"
                 await bot.send_message(
                     chat_id=task.progress_chat_id,
-                    text=f"{status_prefix}\n\nОбновлённый текст:\n\n{new_lyrics}\n\nТеги: {tags}",
+                    text=(
+                        f"{status_prefix}\n\n{body}\n\nТеги: {tags}\n"
+                        f"Цена аудио: {price} ₽ | Баланс: {balance} ₽"
+                    ),
                     reply_markup=review_keyboard(),
                 )
                 logger.info(
@@ -410,7 +532,12 @@ def generate_audio_task(
             text=f"{status_text_prefix}\n⏳ Генерирую аудио…",
         )
         _store_message_id(task_id, status_message_id)
-        suno_result = call_suno(title=task.title_text or "", tags=task.tags_current or "", prompt=task.lyrics_current or "")
+        prompt = task.lyrics_current or ""
+        if preset.get("mode") == "instrumental":
+            required_phrase = "инструментальная композиция, без вокала, без слов"
+            if required_phrase not in prompt.lower():
+                prompt = f"{prompt}. {required_phrase}".strip()
+        suno_result = call_suno(title=task.title_text or "", tags=task.tags_current or "", prompt=prompt)
         if suno_result.request_id is not None:
             with SessionLocal() as session:
                 update_task(
@@ -471,7 +598,7 @@ def generate_audio_task(
 
     tmp_dir = Path(settings.storage_dir) / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    filename = sanitize_filename(task.title_text or "Трек")
+    filename = build_track_filename(task.title_text or "Трек")
     file_path = tmp_dir / f"{filename}.mp3"
 
     async def _set_status_downloading() -> None:
@@ -576,7 +703,7 @@ async def deliver_second_variant(track_id: int, chat_id: int) -> None:
 
     tmp_dir = Path(settings.storage_dir) / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    filename = sanitize_filename(f"{title} (2)")
+    filename = build_track_filename(f"{title} (2)")
     file_path = tmp_dir / f"{filename}.mp3"
 
     async with httpx.AsyncClient(timeout=120) as client:

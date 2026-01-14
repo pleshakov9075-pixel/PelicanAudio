@@ -7,6 +7,7 @@ from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 
 from app.bot.keyboards.inline import (
+    categories_keyboard,
     presets_keyboard,
     text_payment_keyboard,
     title_keyboard,
@@ -33,14 +34,14 @@ from app.core.task_status import (
     WAITING_EDIT_REQUEST,
 )
 from app.core.utils import build_auto_title, is_valid_title, sanitize_title
-from app.presets.loader import load_presets, get_preset
+from app.presets.loader import load_categories, get_presets_by_category, get_preset
 
 router = Router()
 logger = logging.getLogger("bot.create_track")
 
 
 def _preset_line(preset: dict) -> str:
-    return f"🎛 Пресет: {preset['title']}"
+    return f"🎛 Пресет: {preset['title']}\nЦена аудио: {preset['price_audio_rub']} ₽"
 
 
 def _with_preset(preset: dict, text: str) -> str:
@@ -84,9 +85,21 @@ def _consume_text_quota(user_id: int, paid_allowed: bool = False) -> tuple[bool,
 
 @router.message(lambda message: message.text == "🎵 Создать трек")
 async def start_create(message: Message, state: FSMContext) -> None:
-    presets = load_presets()
     await state.clear()
-    await message.answer("Выберите пресет:", reply_markup=presets_keyboard(presets))
+    categories = load_categories()
+    await message.answer("Выберите категорию:", reply_markup=categories_keyboard(categories, prefix="create_category"))
+
+
+@router.callback_query(lambda call: call.data.startswith("create_category:"))
+async def create_category_selected(call: CallbackQuery) -> None:
+    category_id = call.data.split(":")[1]
+    presets = get_presets_by_category(category_id)
+    if not presets:
+        await call.message.answer("В этой категории пока нет пресетов.")
+        await call.answer()
+        return
+    await call.message.answer("Выберите пресет:", reply_markup=presets_keyboard(presets))
+    await call.answer()
 
 
 @router.callback_query(lambda call: call.data.startswith("preset:"))
@@ -98,11 +111,25 @@ async def preset_selected(call: CallbackQuery, state: FSMContext) -> None:
         await call.answer()
         return
     await state.update_data(preset_id=preset_id, used_new_variant=False)
-    await state.set_state(TrackStates.waiting_for_brief)
-    await call.message.answer(
-        f"{_preset_line(preset)}\n\nОтправьте одним сообщением вводные для песни (brief).",
-        reply_markup=main_menu(),
-    )
+    mode = preset.get("mode", "song")
+    if mode == "user_lyrics":
+        await state.set_state(TrackStates.waiting_for_user_lyrics_brief)
+        await call.message.answer(
+            f"{_preset_line(preset)}\n\nОтправьте одним сообщением стиль, настроение и жанр.",
+            reply_markup=main_menu(),
+        )
+    elif mode == "instrumental":
+        await state.set_state(TrackStates.waiting_for_brief)
+        await call.message.answer(
+            f"{_preset_line(preset)}\n\nОпишите инструментал: настроение, темп, инструменты, где будет играть.",
+            reply_markup=main_menu(),
+        )
+    else:
+        await state.set_state(TrackStates.waiting_for_brief)
+        await call.message.answer(
+            f"{_preset_line(preset)}\n\nОтправьте одним сообщением вводные для песни (brief).",
+            reply_markup=main_menu(),
+        )
     await call.answer()
 
 
@@ -131,11 +158,48 @@ async def handle_brief(message: Message, state: FSMContext) -> None:
     await _queue_text_generation(message, state, preset, message.text)
 
 
+@router.message(TrackStates.waiting_for_user_lyrics_brief)
+async def handle_user_lyrics_brief(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    preset = get_preset(data["preset_id"])
+    if not preset:
+        await message.answer("Пресет не найден. Начните заново.")
+        await state.clear()
+        return
+    await state.update_data(brief=message.text)
+    await state.set_state(TrackStates.waiting_for_user_lyrics_text)
+    await message.answer(_with_preset(preset, "Теперь отправьте ваш текст песни одним сообщением."))
+
+
+@router.message(TrackStates.waiting_for_user_lyrics_text)
+async def handle_user_lyrics_text(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    preset = get_preset(data.get("preset_id", ""))
+    if not preset:
+        await message.answer("Пресет не найден. Начните заново.")
+        await state.clear()
+        return
+    allowed, mode = _consume_text_quota(message.from_user.id, paid_allowed=False)
+    if not allowed:
+        await message.answer(
+            _with_preset(
+                preset,
+                "Лимит бесплатных генераций исчерпан. Хотите оформить текст за 19 ₽?",
+            ),
+            reply_markup=text_payment_keyboard(),
+        )
+        await state.update_data(user_lyrics_raw=message.text)
+        return
+    await state.update_data(user_lyrics_raw=message.text)
+    await _queue_text_generation(message, state, preset, data.get("brief", ""), user_lyrics_raw=message.text)
+
+
 @router.callback_query(lambda call: call.data == "textpay:confirm")
 async def paid_text_confirm(call: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     brief = data.get("brief")
     preset = get_preset(data.get("preset_id", ""))
+    user_lyrics_raw = data.get("user_lyrics_raw")
     if not brief or not preset:
         await call.message.answer("Данные не найдены. Начните заново.")
         await call.answer()
@@ -145,7 +209,7 @@ async def paid_text_confirm(call: CallbackQuery, state: FSMContext) -> None:
         await call.message.answer(_with_preset(preset, "Недостаточно средств на балансе."))
         await call.answer()
         return
-    await _queue_text_generation(call.message, state, preset, brief)
+    await _queue_text_generation(call.message, state, preset, brief, user_lyrics_raw=user_lyrics_raw)
     await call.answer()
 
 
@@ -159,8 +223,21 @@ async def paid_text_wait(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer()
 
 
-async def _queue_text_generation(message: Message, state: FSMContext, preset: dict, brief: str) -> None:
-    status_message = await message.answer(_with_preset(preset, "⏳ Генерирую текст…"))
+async def _queue_text_generation(
+    message: Message,
+    state: FSMContext,
+    preset: dict,
+    brief: str,
+    user_lyrics_raw: str | None = None,
+) -> None:
+    mode = preset.get("mode", "song")
+    if mode == "instrumental":
+        status_text = "⏳ Генерирую описание инструментала…"
+    elif mode == "user_lyrics":
+        status_text = "⏳ Оформляю текст…"
+    else:
+        status_text = "⏳ Генерирую текст…"
+    status_message = await message.answer(_with_preset(preset, status_text))
     with SessionLocal() as session:
         user = get_or_create_user(session, message.from_user.id)
         task = create_task(
@@ -169,10 +246,11 @@ async def _queue_text_generation(message: Message, state: FSMContext, preset: di
             preset_id=preset["id"],
             status=TEXT_QUEUED,
             brief=brief,
+            user_lyrics_raw=user_lyrics_raw,
             progress_chat_id=message.chat.id,
             progress_message_id=status_message.message_id,
         )
-    await state.update_data(task_id=task.id, preset_id=preset["id"], brief=brief)
+    await state.update_data(task_id=task.id, preset_id=preset["id"], brief=brief, user_lyrics_raw=user_lyrics_raw)
     await state.set_state(TrackStates.waiting_for_review)
     from app.worker.tasks import enqueue_text_generation
 
@@ -183,6 +261,7 @@ async def _queue_text_generation(message: Message, state: FSMContext, preset: di
 async def _queue_regeneration(message: Message, state: FSMContext, preset: dict, brief: str) -> None:
     data = await state.get_data()
     task_id = data.get("task_id")
+    user_lyrics_raw = data.get("user_lyrics_raw")
     if not task_id:
         await message.answer("Данные не найдены. Начните заново.")
         await state.clear()
@@ -198,6 +277,7 @@ async def _queue_regeneration(message: Message, state: FSMContext, preset: dict,
             tags_current=None,
             error_message=None,
             genapi_request_id=None,
+            user_lyrics_raw=user_lyrics_raw,
         )
     from app.worker.tasks import enqueue_text_generation
 
@@ -289,7 +369,13 @@ async def handle_auto_title(call: CallbackQuery, state: FSMContext) -> None:
         await call.answer()
         return
     brief = data.get("brief", "")
-    title = build_auto_title(preset["title"], brief)
+    task_id = data.get("task_id")
+    suggested_title = None
+    if task_id:
+        with SessionLocal() as session:
+            task = get_task(session, task_id)
+            suggested_title = task.suggested_title if task else None
+    title = sanitize_title(suggested_title) if suggested_title else build_auto_title(preset["title"], brief)
     await state.update_data(title=title)
     await _finalize_track(call.message, state, preset, title)
     await call.answer()
@@ -330,11 +416,17 @@ async def _finalize_track(message: Message, state: FSMContext, preset: dict, tit
     amount = preset["price_audio_rub"]
     with SessionLocal() as session:
         user = get_or_create_user(session, message.from_user.id)
+        balance = user.balance_rub
         transaction = hold_audio(session, user, amount)
     if not transaction:
         with SessionLocal() as session:
             update_task(session, task_id, status=PAYMENT_WAITING)
-        await message.answer(_with_preset(preset, "Недостаточно средств для аудио. Пополните баланс."))
+        await message.answer(
+            _with_preset(
+                preset,
+                f"Недостаточно средств для аудио. Цена: {amount} ₽, баланс: {balance} ₽.",
+            )
+        )
         await state.clear()
         return
     status_message = await message.answer(

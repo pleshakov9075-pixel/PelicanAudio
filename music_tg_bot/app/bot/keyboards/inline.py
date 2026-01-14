@@ -3,9 +3,36 @@ from __future__ import annotations
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 
+def categories_keyboard(categories: list[dict], prefix: str = "category") -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text=category["title"], callback_data=f"{prefix}:{category['id']}")]
+        for category in categories
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 def presets_keyboard(presets: list[dict]) -> InlineKeyboardMarkup:
     buttons = [
-        [InlineKeyboardButton(text=preset["title"], callback_data=f"preset:{preset['id']}")]
+        [
+            InlineKeyboardButton(
+                text=f"{preset['title']} — {preset['price_audio_rub']} ₽",
+                callback_data=f"preset:{preset['id']}",
+            )
+        ]
+        for preset in presets
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def presets_info_keyboard(preset_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="Выбрать пресет", callback_data=f"preset:{preset_id}")]]
+    )
+
+
+def presets_info_list_keyboard(presets: list[dict]) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text=f"{preset['title']} — {preset['price_audio_rub']} ₽", callback_data=f"presetinfo:{preset['id']}")]
         for preset in presets
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)

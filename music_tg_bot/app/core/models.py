@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-from sqlalchemy import BigInteger, String, Integer, Date, DateTime, ForeignKey, UniqueConstraint, Text
+from sqlalchemy import BigInteger, String, Integer, Date, DateTime, ForeignKey, UniqueConstraint, Text, Boolean
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.db import Base
@@ -16,6 +16,7 @@ class User(Base):
     balance_rub: Mapped[int] = mapped_column(Integer, default=0)
     free_quota_date: Mapped[dt.date] = mapped_column(Date, default=dt.date.today)
     free_quota_used: Mapped[int] = mapped_column(Integer, default=0)
+    welcome_bonus_given: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
 
     transactions: Mapped[list[Transaction]] = relationship("Transaction", back_populates="user")
@@ -59,6 +60,7 @@ class Task(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     preset_id: Mapped[str] = mapped_column(String(64))
     brief: Mapped[str | None] = mapped_column(Text, nullable=True)
+    user_lyrics_raw: Mapped[str | None] = mapped_column(Text, nullable=True)
     edit_request: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(32))
     stage: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -70,6 +72,7 @@ class Task(Base):
     mp3_url_1: Mapped[str | None] = mapped_column(Text, nullable=True)
     mp3_url_2: Mapped[str | None] = mapped_column(Text, nullable=True)
     title_text: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    suggested_title: Mapped[str | None] = mapped_column(String(128), nullable=True)
     lyrics_current: Mapped[str | None] = mapped_column(Text, nullable=True)
     tags_current: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)

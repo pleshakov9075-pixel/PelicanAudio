@@ -108,6 +108,24 @@ def add_topup(session: Session, user: User, amount_rub: int, external_id: str) -
     session.commit()
 
 
+def apply_welcome_bonus(session: Session, user: User, amount_rub: int) -> bool:
+    if user.welcome_bonus_given:
+        return False
+    user.balance_rub += amount_rub
+    user.welcome_bonus_given = True
+    session.add(
+        Transaction(
+            user_id=user.id,
+            amount_rub=amount_rub,
+            type="welcome_bonus",
+            status="capture",
+        )
+    )
+    session.add(user)
+    session.commit()
+    return True
+
+
 def create_track(
     session: Session,
     user_id: int,
@@ -142,6 +160,7 @@ def create_task(
     preset_id: str,
     status: str,
     brief: str | None = None,
+    user_lyrics_raw: str | None = None,
     progress_chat_id: int | None = None,
     progress_message_id: int | None = None,
 ) -> Task:
@@ -150,6 +169,7 @@ def create_task(
         preset_id=preset_id,
         status=status,
         brief=brief,
+        user_lyrics_raw=user_lyrics_raw,
         progress_chat_id=progress_chat_id,
         progress_message_id=progress_message_id,
     )
