@@ -13,6 +13,7 @@ cp .env.example .env
 2) Заполните `.env`:
 - `BOT_TOKEN` — токен вашего Telegram-бота.
 - `GENAPI_API_KEY` — ключ GenAPI.
+- `ADMIN_IDS` — список Telegram user_id администраторов через запятую (например, `123456789,987654321`).
 
 3) (Опционально) Добавьте ключи YooKassa позже:
 - `YOOKASSA_SHOP_ID`
@@ -49,6 +50,11 @@ POST {BASE_URL}/api/payments/yookassa/webhook
 - После лимита — текст за 19 ₽.
 - Генерация аудио по тарифам из `presets.yaml`.
 - Баланс в рублях (целые значения).
+
+## Как узнать свой Telegram user_id
+
+- Напишите боту `/start` и посмотрите user_id в логах запуска.
+- Либо воспользуйтесь ботом @userinfobot и возьмите поле `id` для записи в `ADMIN_IDS`.
 
 ## Структура
 

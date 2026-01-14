@@ -25,6 +25,22 @@ class Settings:
     base_url: str
     storage_dir: Path
     environment: str
+    admin_ids: list[int]
+
+
+def _parse_admin_ids(raw_value: str | None) -> list[int]:
+    if not raw_value:
+        return []
+    admin_ids: list[int] = []
+    for chunk in raw_value.split(","):
+        cleaned = chunk.strip()
+        if not cleaned:
+            continue
+        try:
+            admin_ids.append(int(cleaned))
+        except ValueError:
+            continue
+    return admin_ids
 
 
 def load_settings() -> Settings:
@@ -50,6 +66,7 @@ def load_settings() -> Settings:
         base_url=os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/"),
         storage_dir=storage_dir,
         environment=os.environ.get("ENVIRONMENT", "production"),
+        admin_ids=_parse_admin_ids(os.environ.get("ADMIN_IDS", "")),
     )
 
 

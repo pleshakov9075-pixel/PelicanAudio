@@ -1,6 +1,6 @@
 from aiogram import Router
 
-from app.bot.handlers import start, presets, balance, help as help_handler, create_track
+from app.bot.handlers import start, presets, balance, help as help_handler, create_track, admin
 
 
 def setup_router() -> Router:
@@ -10,4 +10,5 @@ def setup_router() -> Router:
     router.include_router(balance.router)
     router.include_router(help_handler.router)
     router.include_router(create_track.router)
+    router.include_router(admin.router)
     return router

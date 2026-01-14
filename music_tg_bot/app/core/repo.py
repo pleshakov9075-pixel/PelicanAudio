@@ -23,6 +23,53 @@ def get_or_create_user(session: Session, tg_id: int) -> User:
     return user
 
 
+def get_or_create_user_by_tg_id(session: Session, tg_id: int) -> User:
+    return get_or_create_user(session, tg_id)
+
+
+def get_balance(session: Session, tg_id: int) -> int:
+    user = get_or_create_user_by_tg_id(session, tg_id)
+    return user.balance_rub
+
+
+def add_balance(session: Session, tg_id: int, amount: int) -> int:
+    user = get_or_create_user_by_tg_id(session, tg_id)
+    user.balance_rub += amount
+    session.add_all(
+        [
+            user,
+            Transaction(
+                user_id=user.id,
+                amount_rub=amount,
+                type="admin_add",
+                status="capture",
+            ),
+        ]
+    )
+    session.commit()
+    session.refresh(user)
+    return user.balance_rub
+
+
+def set_balance(session: Session, tg_id: int, amount: int) -> int:
+    user = get_or_create_user_by_tg_id(session, tg_id)
+    user.balance_rub = amount
+    session.add_all(
+        [
+            user,
+            Transaction(
+                user_id=user.id,
+                amount_rub=amount,
+                type="admin_set",
+                status="capture",
+            ),
+        ]
+    )
+    session.commit()
+    session.refresh(user)
+    return user.balance_rub
+
+
 def reset_quota_if_needed(user: User) -> None:
     today = dt.date.today()
     if user.free_quota_date != today:
