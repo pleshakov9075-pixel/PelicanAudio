@@ -646,6 +646,8 @@ def generate_audio_task(
     task, preset = _load_task_and_preset(task_id)
     if not task or not preset:
         return
+    title_text = (task.title_text or "").strip()
+    title_line = f"🎼 Название: {title_text}" if title_text else "🎼 Название: —"
     logger.info(
         "Старт генерации аудио",
         extra={
@@ -655,7 +657,7 @@ def generate_audio_task(
             "user_id": task.user_id,
         },
     )
-    status_text_prefix = f"🎛 Пресет: {preset['title']}"
+    status_text_prefix = f"🎛 Пресет: {preset['title']}\n{title_line}"
     try:
         with SessionLocal() as session:
             update_task(session, task_id, status=AUDIO_RUNNING)
@@ -687,6 +689,7 @@ def generate_audio_task(
             _store_message_id(task_id, status_message_id)
         urls = suno_result.result
         mp3_url_1, mp3_url_2 = urls[0], urls[1]
+        track_id = None
         with SessionLocal() as session:
             track = create_track(
                 session,
@@ -698,6 +701,7 @@ def generate_audio_task(
                 mp3_url_1=mp3_url_1,
                 mp3_url_2=mp3_url_2,
             )
+            track_id = track.id
             update_task(
                 session,
                 task_id,
@@ -787,8 +791,8 @@ def generate_audio_task(
             await bot.send_document(
                 chat_id=chat_id,
                 document=FSInputFile(file_path),
-                caption=f"{status_text_prefix}\n✅ Готово! Вот ваш трек: {task.title_text}",
-                reply_markup=second_variant_keyboard(track.id),
+                caption=f"{status_text_prefix}\n✅ Готово! Вот ваш трек: {title_text}",
+                reply_markup=second_variant_keyboard(track_id),
             )
             logger.info(
                 "Аудио отправлено в Telegram",
@@ -798,7 +802,7 @@ def generate_audio_task(
                 bot,
                 chat_id,
                 status_message_id,
-                f"{status_text_prefix}\n✅ Готово! Вот ваш трек: {task.title_text}",
+                f"{status_text_prefix}\n✅ Готово! Вот ваш трек: {title_text}",
             )
             with SessionLocal() as session:
                 update_task(session, task_id, status=SUCCEEDED)
@@ -849,7 +853,12 @@ async def deliver_second_variant(track_id: int, chat_id: int) -> None:
 
     bot = Bot(token=settings.bot_token)
     await bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
-    await bot.send_document(chat_id=chat_id, document=FSInputFile(file_path))
+    title_line = f"🎼 Название: {title}" if title else "🎼 Название: —"
+    await bot.send_document(
+        chat_id=chat_id,
+        document=FSInputFile(file_path),
+        caption=f"{title_line}\n🎧 Второй вариант",
+    )
     await bot.session.close()
     try:
         file_path.unlink()

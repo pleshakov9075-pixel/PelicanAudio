@@ -68,6 +68,11 @@ def _with_preset(preset: dict, text: str, balance: int | None = None) -> str:
     return f"{_preset_line(preset, balance=balance)}\n{text}"
 
 
+def _title_line(title: str | None) -> str:
+    safe_title = (title or "").strip()
+    return f"🎼 Название: {safe_title}" if safe_title else "🎼 Название: —"
+
+
 def _get_user_balance(user_id: int) -> int:
     with SessionLocal() as session:
         user = get_or_create_user(session, user_id)
@@ -85,7 +90,12 @@ def _is_edit_cancel(text: str | None) -> bool:
     return False
 
 
-async def _send_or_edit_progress(message: Message, task_id: int, text: str) -> int:
+async def _send_or_edit_progress(
+    message: Message,
+    task_id: int,
+    text: str,
+    reply_markup=None,
+) -> int:
     with SessionLocal() as session:
         task = get_task(session, task_id)
         status_message_id = task.progress_message_id if task else None
@@ -95,11 +105,12 @@ async def _send_or_edit_progress(message: Message, task_id: int, text: str) -> i
                 chat_id=message.chat.id,
                 message_id=status_message_id,
                 text=text,
+                reply_markup=reply_markup,
             )
             return status_message_id
         except Exception as exc:
             logger.warning("Не удалось обновить статусное сообщение: %s", exc)
-    new_message = await message.answer(text)
+    new_message = await message.answer(text, reply_markup=reply_markup)
     with SessionLocal() as session:
         update_task(
             session,
@@ -410,10 +421,18 @@ async def review_actions(call: CallbackQuery, state: FSMContext) -> None:
             with SessionLocal() as session:
                 update_task(session, task_id, status=TITLE_WAITING)
         await state.set_state(TrackStates.waiting_for_title)
-        await call.message.answer(
-            f"{_preset_line(preset)}\n\n🎼 Введите название трека или нажмите 🎲 Автоназвание",
-            reply_markup=title_keyboard(),
-        )
+        if task_id:
+            await _send_or_edit_progress(
+                call.message,
+                task_id,
+                f"{_preset_line(preset)}\n\n🎼 Введите название трека или нажмите 🎲 Автоназвание",
+                reply_markup=title_keyboard(),
+            )
+        else:
+            await call.message.answer(
+                f"{_preset_line(preset)}\n\n🎼 Введите название трека или нажмите 🎲 Автоназвание",
+                reply_markup=title_keyboard(),
+            )
     elif action == "edit":
         task_id = data.get("task_id")
         if task_id:
@@ -569,8 +588,15 @@ async def _finalize_track(message: Message, state: FSMContext, preset: dict, tit
         balance = get_balance(session, message.from_user.id)
     await state.update_data(pending_audio_amount=amount)
     await state.set_state(TrackStates.waiting_for_audio_confirm)
-    await message.answer(
-        _with_preset(preset, f"Списать {amount} ₽ за аудио? Баланс: {balance} ₽"),
+    status_text = (
+        f"{_preset_line(preset, balance=balance)}\n"
+        f"{_title_line(title)}\n"
+        f"Списать {amount} ₽ за аудио?"
+    )
+    await _send_or_edit_progress(
+        message,
+        task_id,
+        status_text,
         reply_markup=audio_payment_confirm_keyboard(),
     )
 
@@ -585,24 +611,43 @@ async def audio_payment_confirm(call: CallbackQuery, state: FSMContext) -> None:
         await call.message.answer("Данные не найдены. Начните заново.")
         await call.answer()
         return
+    title_text = data.get("title")
     with SessionLocal() as session:
+        task = get_task(session, task_id)
+        title_text = title_text or (task.title_text if task else None)
+        balance_before = get_balance(session, call.from_user.id)
         try:
-            adjust_balance(session, call.from_user.id, -amount, "spend_audio", task_id=task_id)
+            balance_after = adjust_balance(session, call.from_user.id, -amount, "spend_audio", task_id=task_id)
         except InsufficientFunds:
             current_balance = get_balance(session, call.from_user.id)
             update_task(session, task_id, status=PAYMENT_WAITING)
-            await call.message.answer(
-                _with_preset(
-                    preset,
-                    f"Недостаточно средств для аудио. Цена: {amount} ₽, баланс: {current_balance} ₽.",
-                )
+            await _send_or_edit_progress(
+                call.message,
+                task_id,
+                (
+                    f"{_preset_line(preset, balance=current_balance)}\n"
+                    f"{_title_line(title_text)}\n"
+                    f"Недостаточно средств для аудио. Цена: {amount} ₽."
+                ),
             )
             await state.clear()
             await call.answer()
             return
-    status_message = await call.message.answer(
-        _with_preset(preset, "⏳ Генерирую аудио…"),
-        reply_markup=main_menu(),
+    logger.info(
+        "Списан баланс за аудио",
+        extra={
+            "task_id": task_id,
+            "user_id": call.from_user.id,
+            "balance_before": balance_before,
+            "price": amount,
+            "balance_after": balance_after,
+        },
+    )
+    status_message_id = await _send_or_edit_progress(
+        call.message,
+        task_id,
+        f"{_preset_line(preset)}\n{_title_line(title_text)}\n⏳ Генерирую аудио…",
+        reply_markup=None,
     )
     await state.clear()
     from app.worker.tasks import enqueue_audio_generation
@@ -610,7 +655,7 @@ async def audio_payment_confirm(call: CallbackQuery, state: FSMContext) -> None:
     job_id = enqueue_audio_generation(
         task_id=task_id,
         chat_id=call.message.chat.id,
-        status_message_id=status_message.message_id,
+        status_message_id=status_message_id,
     )
     with SessionLocal() as session:
         update_task(
@@ -618,7 +663,7 @@ async def audio_payment_confirm(call: CallbackQuery, state: FSMContext) -> None:
             task_id,
             status=AUDIO_QUEUED,
             progress_chat_id=call.message.chat.id,
-            progress_message_id=status_message.message_id,
+            progress_message_id=status_message_id,
         )
     logger.info("Трек поставлен в очередь: %s", job_id)
     await call.answer()
@@ -633,10 +678,19 @@ async def audio_payment_back(call: CallbackQuery, state: FSMContext) -> None:
         await call.answer()
         return
     await state.set_state(TrackStates.waiting_for_title)
-    await call.message.answer(
-        f"{_preset_line(preset)}\n\n🎼 Введите название трека или нажмите 🎲 Автоназвание",
-        reply_markup=title_keyboard(),
-    )
+    task_id = data.get("task_id")
+    if task_id:
+        await _send_or_edit_progress(
+            call.message,
+            task_id,
+            f"{_preset_line(preset)}\n\n🎼 Введите название трека или нажмите 🎲 Автоназвание",
+            reply_markup=title_keyboard(),
+        )
+    else:
+        await call.message.answer(
+            f"{_preset_line(preset)}\n\n🎼 Введите название трека или нажмите 🎲 Автоназвание",
+            reply_markup=title_keyboard(),
+        )
     await call.answer()
 
 
