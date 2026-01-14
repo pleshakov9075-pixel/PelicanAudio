@@ -29,6 +29,7 @@ from app.core.task_status import (
     CANCELED,
     EDIT_QUEUED,
     PAYMENT_WAITING,
+    REVIEW_READY,
     TEXT_QUEUED,
     TITLE_WAITING,
     WAITING_EDIT_REQUEST,
@@ -40,12 +41,33 @@ router = Router()
 logger = logging.getLogger("bot.create_track")
 
 
+_EDIT_CANCEL_KEYWORDS = {
+    "нет",
+    "не надо",
+    "ничего",
+    "отмена",
+    "cancel",
+    "no",
+}
+
+
 def _preset_line(preset: dict) -> str:
     return f"🎛 Пресет: {preset['title']}\nЦена аудио: {preset['price_audio_rub']} ₽"
 
 
 def _with_preset(preset: dict, text: str) -> str:
     return f"{_preset_line(preset)}\n{text}"
+
+
+def _is_edit_cancel(text: str | None) -> bool:
+    normalized = (text or "").strip().lower()
+    if not normalized:
+        return True
+    if normalized in _EDIT_CANCEL_KEYWORDS:
+        return True
+    if normalized in {".", ".."}:
+        return True
+    return False
 
 
 async def _send_or_edit_progress(message: Message, task_id: int, text: str) -> int:
@@ -344,6 +366,37 @@ async def handle_edit(message: Message, state: FSMContext) -> None:
     if not preset or not task_id:
         await message.answer("Данные не найдены. Начните заново.")
         await state.clear()
+        return
+    if _is_edit_cancel(message.text):
+        with SessionLocal() as session:
+            task = get_task(session, task_id)
+            lyrics = task.lyrics_current if task else None
+            tags = task.tags_current if task else None
+            update_task(session, task_id, status=REVIEW_READY, edit_request=None)
+            user = get_or_create_user(session, message.from_user.id)
+            balance = user.balance_rub
+        if not lyrics or not tags:
+            await message.answer("Нет данных для ревью. Начните заново.")
+            await state.clear()
+            return
+        from app.bot.keyboards.inline import review_keyboard
+
+        mode = preset.get("mode", "song")
+        status_prefix = f"🎛 Пресет: {preset['title']}"
+        if mode == "instrumental":
+            body = f"Описание инструментала:\n\n{lyrics}"
+        else:
+            body = f"Текст песни:\n\n{lyrics}"
+        price = preset.get("price_audio_rub", 0)
+        await message.answer(
+            text=(
+                "Ок, оставляем как есть ✅\n\n"
+                f"{status_prefix}\n\n{body}\n\nТеги: {tags}\n"
+                f"Цена аудио: {price} ₽ | Баланс: {balance} ₽"
+            ),
+            reply_markup=review_keyboard(),
+        )
+        await state.set_state(TrackStates.waiting_for_review)
         return
     await _send_or_edit_progress(message, task_id, _with_preset(preset, "⏳ Применяю правки…"))
     with SessionLocal() as session:

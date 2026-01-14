@@ -388,6 +388,7 @@ def generate_edit_task(task_id: int) -> None:
         },
     )
     status_prefix = f"🎛 Пресет: {preset['title']}"
+    mode = preset.get("mode", "song")
     with SessionLocal() as session:
         update_task(session, task_id, status=EDIT_RUNNING)
     status_message_id = _update_progress_message(
@@ -413,6 +414,22 @@ def generate_edit_task(task_id: int) -> None:
             )
             _store_message_id(task_id, status_message_id)
         new_lyrics = edit_result.result
+        if not isinstance(new_lyrics, str) or not new_lyrics.strip():
+            with SessionLocal() as session:
+                update_task(
+                    session,
+                    task_id,
+                    status=FAILED,
+                    error_message="Empty edit result",
+                    genapi_request_id=None,
+                )
+            _update_progress_message(
+                chat_id=task.progress_chat_id,
+                message_id=status_message_id,
+                text=f"{status_prefix}\n❌ Не удалось применить правки. Попробуй ещё раз.",
+            )
+            return
+        new_lyrics = new_lyrics.strip()
         with SessionLocal() as session:
             update_task(
                 session,
@@ -449,6 +466,7 @@ def generate_edit_task(task_id: int) -> None:
                 session,
                 task_id,
                 status=REVIEW_READY,
+                lyrics_current=new_lyrics,
                 tags_current=tags,
                 genapi_request_id=None,
             )
@@ -466,9 +484,9 @@ def generate_edit_task(task_id: int) -> None:
                 balance = _get_user_balance(task.user_id)
                 price = preset.get("price_audio_rub", 0)
                 if mode == "instrumental":
-                    body = f"Обновлённое описание инструментала:\n\n{new_lyrics}"
+                    body = f"Описание инструментала:\n\n{new_lyrics}"
                 else:
-                    body = f"Обновлённый текст:\n\n{new_lyrics}"
+                    body = f"Текст песни:\n\n{new_lyrics}"
                 await bot.send_message(
                     chat_id=task.progress_chat_id,
                     text=(
