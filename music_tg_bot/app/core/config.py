@@ -35,8 +35,8 @@ def load_settings() -> Settings:
         genapi_base_url=os.environ.get("GENAPI_BASE_URL", "https://api.gen-api.ru"),
         genapi_api_key=os.environ.get("GENAPI_API_KEY", "").strip(),
         genapi_timeout_connect=float(os.environ.get("GENAPI_TIMEOUT_CONNECT", "30")),
-        genapi_timeout_read_grok=float(os.environ.get("GENAPI_TIMEOUT_READ_GROK", "60")),
-        genapi_timeout_read_suno=float(os.environ.get("GENAPI_TIMEOUT_READ_SUNO", "240")),
+        genapi_timeout_read_grok=float(os.environ.get("GENAPI_TIMEOUT_READ_GROK", "90")),
+        genapi_timeout_read_suno=float(os.environ.get("GENAPI_TIMEOUT_READ_SUNO", "300")),
         genapi_retries=int(os.environ.get("GENAPI_RETRIES", "3")),
         genapi_retry_backoff=float(os.environ.get("GENAPI_RETRY_BACKOFF", "1")),
         database_url=os.environ.get(

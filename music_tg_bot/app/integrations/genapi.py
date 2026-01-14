@@ -39,7 +39,7 @@ def _post_with_retries(
             response = httpx.post(url, headers=_headers(), json=payload, timeout=timeout)
             response.raise_for_status()
             return response
-        except httpx.RequestError as exc:
+        except (httpx.TimeoutException, TimeoutError) as exc:
             last_exc = exc
             if attempt < retries:
                 delay = backoff * (2 ** (attempt - 1))
@@ -53,6 +53,21 @@ def _post_with_retries(
                     time.sleep(delay)
                 continue
             logger.exception("Сетевая ошибка GenAPI (%s) после ретраев", operation)
+            raise GenApiError("⚠️ Не удалось связаться с GenAPI, попробуйте ещё раз") from exc
+        except httpx.RequestError as exc:
+            last_exc = exc
+            if "TLS handshake timeout" in str(exc) and attempt < retries:
+                delay = backoff * (2 ** (attempt - 1))
+                logger.warning(
+                    "TLS handshake timeout GenAPI (%s), повтор через %s сек: %s",
+                    operation,
+                    delay,
+                    exc,
+                )
+                if delay:
+                    time.sleep(delay)
+                continue
+            logger.exception("Сетевая ошибка GenAPI (%s) без ретраев", operation)
             raise GenApiError("⚠️ Не удалось связаться с GenAPI, попробуйте ещё раз") from exc
         except httpx.HTTPStatusError as exc:
             logger.error("HTTP ошибка GenAPI (%s): %s", operation, exc)
@@ -73,7 +88,7 @@ def call_grok(messages: list[dict[str, Any]]) -> str:
         "stream": False,
         "is_sync": False,
     }
-    url = f"{settings.genapi_base_url.rstrip('/')}/v1/chat/completions"
+    url = f"{settings.genapi_base_url.rstrip('/')}/api/v1/networks/grok-4-1"
     response = _post_with_retries(
         url,
         payload,
@@ -96,7 +111,7 @@ def call_suno(title: str, tags: str, prompt: str) -> list[str]:
         "translate_input": False,
         "model": "v5",
     }
-    url = f"{settings.genapi_base_url.rstrip('/')}/v1/suno"
+    url = f"{settings.genapi_base_url.rstrip('/')}/api/v1/networks/suno"
     response = _post_with_retries(
         url,
         payload,
